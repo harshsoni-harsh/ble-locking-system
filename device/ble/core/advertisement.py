@@ -2,6 +2,7 @@ from dbus_next.constants import PropertyAccess
 from dbus_next.service import ServiceInterface, method, dbus_property
 from dbus_next.signature import Variant
 
+
 class Advertisement(ServiceInterface):
     def __init__(self, path, local_name, service_uuids):
         super().__init__('org.bluez.LEAdvertisement1')
@@ -20,19 +21,15 @@ class Advertisement(ServiceInterface):
     @dbus_property(access=PropertyAccess.READ)
     def ServiceUUIDs(self) -> 'as':
         return self.service_uuids
-    
-    # @dbus_property(access=PropertyAccess.READ)
-    # def Includes(self) -> 'as':
-    #     return ["tx-power"]
-    
+
     @dbus_property(access=PropertyAccess.READ)
     def TxPower(self) -> 'n':
         return 0   # in dBm
-    
+
     @dbus_property(access=PropertyAccess.READ)
     def Appearance(self) -> 'q':
         return 128
-    
+
     @dbus_property(access=PropertyAccess.READ)
     def ManufacturerData(self) -> 'a{qv}':
         return {0xFFFF: Variant('ay', bytes([0x01]))}
