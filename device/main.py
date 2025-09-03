@@ -6,7 +6,7 @@ import logging
 
 from ble.core.application import GATTApplication
 from ble.core.advertisement import Advertisement
-from ble.services.battery import BatteryService
+from ble.services import LCService
 
 logging.getLogger("dbus_next.message_bus").setLevel(logging.CRITICAL)
 
@@ -20,14 +20,14 @@ async def main():
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
     services = [
-        BatteryService("/org/bluez/example/service0"),
+        LCService("/org/bluez/example/service0"),
     ]
 
     app = GATTApplication(APP_PATH, services)
     advertisement = Advertisement(
         LE_ADVERTISEMENT_PATH,
         "Starlink",
-        [s._uuid for s in services]
+        [s.uuid for s in services]
     )
 
     intro = await bus.introspect(BLUEZ, ADAPTER_PATH)
@@ -40,16 +40,18 @@ async def main():
         bus.export(APP_PATH, app)
 
         for service in services:
-            bus.export(service._path, service)
-            for char in service._characteristics:
-                bus.export(char._path, char)
+            bus.export(service.path, service)
+            for char in service.characteristics:
+                bus.export(char.path, char)
+                print("Registered char:", char.path)
                 for desc in getattr(char, "descriptors", []):
+                    print("Registered desc:", desc.path)
                     bus.export(desc.path, desc)
 
-
         await gatt_mgr.call_register_application(APP_PATH, {})
-        bus.export(advertisement.path, advertisement)
+
         print("Registering Advertisement...")
+        bus.export(advertisement.path, advertisement)
         await adv_mgr.call_register_advertisement(advertisement.path, {})
 
         print("\n✅ Device is now advertising and GATT server is running.")

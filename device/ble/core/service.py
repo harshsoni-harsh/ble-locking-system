@@ -4,17 +4,13 @@ from dbus_next.service import ServiceInterface, dbus_property
 class GATTService(ServiceInterface):
     def __init__(self, path: str, uuid: str, characteristics: list):
         super().__init__('org.bluez.GattService1')
-        self._path = path
-        self._uuid = uuid
-        self._characteristics = characteristics
-
-    @property
-    def path(self):
-        return self._path   # used internally
+        self.path = path
+        self.uuid = uuid
+        self.characteristics = characteristics
 
     @dbus_property(access=PropertyAccess.READ)
     def UUID(self) -> 's':
-        return self._uuid
+        return self.uuid
 
     @dbus_property(access=PropertyAccess.READ)
     def Primary(self) -> 'b':
@@ -22,4 +18,4 @@ class GATTService(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Characteristics(self) -> 'ao':
-        return [c.path for c in self._characteristics]
+        return [c.path for c in self.characteristics]

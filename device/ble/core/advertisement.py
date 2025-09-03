@@ -21,11 +21,11 @@ class Advertisement(ServiceInterface):
     @dbus_property(access=PropertyAccess.READ)
     def ServiceUUIDs(self) -> 'as':
         return self.service_uuids
-
+    
     @dbus_property(access=PropertyAccess.READ)
-    def TxPower(self) -> 'n':
-        return 0   # in dBm
-
+    def Includes(self) -> 'as':
+        return []
+    
     @dbus_property(access=PropertyAccess.READ)
     def Appearance(self) -> 'q':
         return 128
@@ -33,7 +33,3 @@ class Advertisement(ServiceInterface):
     @dbus_property(access=PropertyAccess.READ)
     def ManufacturerData(self) -> 'a{qv}':
         return {0xFFFF: Variant('ay', bytes([0x01]))}
-
-    @method()
-    def Release(self):
-        print("Advertisement released")

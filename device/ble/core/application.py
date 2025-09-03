@@ -29,9 +29,9 @@ class GATTApplication(ServiceInterface):
 
         for svc in self.services:
             # Service node
-            managed[svc._path] = {
+            managed[svc.path] = {
                 'org.bluez.GattService1': {
-                    'UUID': svc._uuid,
+                    'UUID': svc.uuid,
                     'Primary': True,
                     'Includes': [],
                 }
@@ -41,21 +41,22 @@ class GATTApplication(ServiceInterface):
             for ch in getattr(svc, 'characteristics', []):
                 managed[ch.path] = {
                     'org.bluez.GattCharacteristic1': {
-                        'UUID': ch._uuid,
-                        'Service': svc._path,
-                        'Flags': ch._flags,
-                        'Descriptors': [d._path for d in getattr(ch, 'descriptors', [])],
+                        'UUID': ch.uuid,
+                        'Service': svc.path,
+                        'Flags': ch.flags,
+                        'Descriptors': [d.path for d in getattr(ch, 'descriptors', [])],
                         'Notifying': getattr(ch, 'notifying', False),
                     }
                 }
 
                 # Descriptor nodes (if any)
                 for d in getattr(ch, 'descriptors', []):
-                    managed[d._path] = {
+                    managed[d.path] = {
                         'org.bluez.GattDescriptor1': {
-                            'UUID': d._uuid,
-                            'Characteristic': ch._path,
-                            'Flags': d._flags,
+                            'UUID': d.uuid,
+                            'Characteristic': ch.path,
+                            'Flags': d.flags,
+                            'Value': d.value,
                         }
                     }
 
