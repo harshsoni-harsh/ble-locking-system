@@ -59,13 +59,14 @@ class LCService(GATTService):
 
     # -- auth helpers --
     def start_auth_handshake(self):
-        """Start a new handshake: bump counter, generate nonce, clear session auth, notify nonce."""
+        """Start a new handshake: bump counter, generate nonce, clear session auth, notify nonce+counter."""
         self.conn_counter = (self.conn_counter + 1) & 0xFFFFFFFF
         self.session_auth = False
         self.last_nonce = secrets.token_bytes(16)
-        # notify client with nonce on auth characteristic
+        # notify client with nonce and conn_counter (nonce||counter_le)
         if hasattr(self, 'auth_char'):
-            self.auth_char.notify(self.last_nonce)
+            payload = self.last_nonce + self.conn_counter.to_bytes(4, 'little')
+            self.auth_char.notify(payload)
 
     def validate_auth(self, client_mac: bytes) -> bool:
         """Validate client MAC (HMAC) over b"AUTH"||nonce||connCounter."""
@@ -81,7 +82,7 @@ class LCService(GATTService):
 class AuthCharacteristic(GATTCharacteristic):
     def __init__(self, path, service: LCService):
         # notify + write without response
-        super().__init__(os.path, "3a2ac7f1-5ca0-4d93-93a0-9b1e3aee0a10", ["notify", "write"], service, initial_value=b"")
+        super().__init__(path, "3a2ac7f1-5ca0-4d93-93a0-9b1e3aee0a10", ["notify", "write"], service, initial_value=b"")
 
     @method()
     def StartNotify(self):
