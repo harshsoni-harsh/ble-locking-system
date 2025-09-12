@@ -1,4 +1,4 @@
-import os
+import os, time
 from ble.core.service import GATTService
 from ble.core.characteristic import GATTCharacteristic, method
 from ble.core.descriptor import GATTDescriptor

@@ -11,11 +11,15 @@ class GATTCharacteristic(ServiceInterface):
         self.uuid = uuid
         self.flags = flags
         self.service = service
-        self.value = initial_value
+        self._value = initial_value
         self.on_read = on_read
         self.on_write = on_write
         self.notifying = False
         self.descriptors = descriptors
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Value(self) -> 'ay':
+        return self._value
 
     @dbus_property(access=PropertyAccess.READ)
     def UUID(self) -> 's':
@@ -39,8 +43,8 @@ class GATTCharacteristic(ServiceInterface):
 
     @method()
     def ReadValue(self, options: 'a{sv}') -> 'ay':
-        print(f"[READ] Returning: {self.value}")
-        return self.value
+        print(f"[READ] Returning: {self._value}")
+        return self._value
 
     @method()
     def StartNotify(self):
@@ -55,7 +59,7 @@ class GATTCharacteristic(ServiceInterface):
             print("[CCCD] Notifications disabled")
     
     def notify(self, value):
-        self.value = value
+        self._value = value
 
         if self.notifying:
             self.emit_properties_changed({"Value": value})
