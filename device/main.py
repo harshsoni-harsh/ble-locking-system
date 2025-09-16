@@ -1,5 +1,5 @@
 import asyncio
-from dbus_next.aio import MessageBus
+from dbus_next.aio.message_bus import MessageBus
 from dbus_next.constants import BusType
 from dbus_next.errors import DBusError
 import logging
@@ -7,14 +7,9 @@ import logging
 from ble.core.application import GATTApplication
 from ble.core.advertisement import Advertisement
 from ble.services import LCService
+from ble.constants import APP_PATH, LE_ADVERTISEMENT_PATH, BLUEZ, ADAPTER_PATH
 
 logging.getLogger("dbus_next.message_bus").setLevel(logging.CRITICAL)
-
-BLUEZ = 'org.bluez'
-ADAPTER_PATH = '/org/bluez/hci0'
-APP_PATH = '/org/bluez/example'
-LE_ADVERTISEMENT_PATH = '/org/bluez/example/advertisement0'
-
 
 async def main():
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -44,9 +39,6 @@ async def main():
             for char in service.characteristics:
                 bus.export(char.path, char)
                 print("Registered char:", char.path)
-                for desc in getattr(char, "descriptors", []):
-                    print("Registered desc:", desc.path)
-                    bus.export(desc.path, desc)
 
         await gatt_mgr.call_register_application(APP_PATH, {})
 

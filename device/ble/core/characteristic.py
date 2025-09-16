@@ -5,7 +5,7 @@ from dbus_next.service import ServiceInterface, dbus_property, method
 from ble.core.service import GATTService
 
 class GATTCharacteristic(ServiceInterface):
-    def __init__(self, path, uuid, flags, service: GATTService, initial_value=b"", on_read=None, on_write=None, descriptors=[]):
+    def __init__(self, path, uuid, flags, service: GATTService, initial_value=b"", on_read=None, on_write=None):
         super().__init__('org.bluez.GattCharacteristic1')
         self.path = path
         self.uuid = uuid
@@ -15,7 +15,7 @@ class GATTCharacteristic(ServiceInterface):
         self.on_read = on_read
         self.on_write = on_write
         self.notifying = False
-        self.descriptors = descriptors
+        self.descriptors = []
 
     @dbus_property(access=PropertyAccess.READ)
     def Value(self) -> 'ay':
@@ -40,6 +40,9 @@ class GATTCharacteristic(ServiceInterface):
     @dbus_property(access=PropertyAccess.READ)
     def Descriptors(self) -> 'ao':
         return [d.path for d in self.descriptors]
+    
+    def add_descriptor(self, descriptor):
+        self.descriptors.append(descriptor)
 
     @method()
     def ReadValue(self, options: 'a{sv}') -> 'ay':
