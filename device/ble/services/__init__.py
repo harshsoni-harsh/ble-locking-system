@@ -3,12 +3,11 @@ import time
 import hmac
 import hashlib
 import secrets
-from dbus_next.aio.message_bus import MessageBus
 
 from ble.core.service import GATTService
 from ble.core.characteristic import GATTCharacteristic, method
 from ble.core.descriptor import GATTDescriptor
-from ble.constants import ADAPTER_PATH, BLUEZ, AUTH_PSK_ENV, SESSION_TIMEOUT, TX_POWER_DEFAULT
+from ble.constants import AUTH_PSK_ENV, SESSION_TIMEOUT, TX_POWER_DEFAULT
 
 class LCService(GATTService):
     def __init__(self, path):
@@ -113,38 +112,7 @@ class LCService(GATTService):
         self.session_auth = ok
         if ok:
             self.session_start_time = time.time()
-            await self.update_rssi_from_bluez(device_path)
         return ok
-
-    # ---------------- Proximity helpers ----------------
-    def update_rssi(self, rssi: int):
-        """Update RSSI, recompute proximity."""
-        self.last_rssi = rssi
-        self.check_proximity()
-
-    def check_proximity(self):
-        """Decide if device is near enough based on RSSI + TxPower."""
-        if self.last_rssi is None:
-            return
-        # Distance approximation using path-loss model
-        distance = 10 ** ((self.tx_power - self.last_rssi) / (10 * 2))  # n≈2
-        self.proximity_ok = distance < 2.0  # threshold = 2m
-        self.proximity_char.notify(bytes([1 if self.proximity_ok else 0]))
-
-    async def update_rssi_from_bluez(self, device_path: str):
-        """Fetch RSSI from BlueZ for the authenticated device."""
-        try:
-            bus = await MessageBus().connect()
-            intro = await bus.introspect(BLUEZ, ADAPTER_PATH)
-            obj = bus.get_proxy_object("org.bluez", device_path, intro)
-            props_iface = obj.get_interface("org.freedesktop.DBus.Properties")
-            rssi = await props_iface.call_get("org.bluez.Device1", "RSSI")
-            self.update_rssi(rssi)
-            print(f"[PROXIMITY] RSSI={rssi}, proximity_ok={self.proximity_ok}")
-        except Exception as e:
-            print(f"[PROXIMITY] Could not read RSSI: {e}")
-
-
 
 # ---------------- Characteristics ----------------
 
@@ -196,9 +164,9 @@ class LockedCharacteristic(GATTCharacteristic):
         if not self.service.is_session_valid(device_path):
             print("[AUTH] Write denied: invalid or expired session")
             return
-        if not getattr(self.service, "proximity_ok", False):
-            print("[AUTH] Write denied: device not in proximity")
-            return
+        # if not getattr(self.service, "proximity_ok", False):
+        #     print("[AUTH] Write denied: device not in proximity")
+        #     return
         try:
             new_state = bool(int(bytes(value)[0]))
             self.service.toggle_locked(new_state)
