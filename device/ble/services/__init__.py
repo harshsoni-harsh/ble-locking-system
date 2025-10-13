@@ -4,7 +4,7 @@ import hmac
 import hashlib
 import secrets
 import threading
-import zmq
+import subprocess
 
 from ble.core.service import GATTService
 from ble.core.characteristic import GATTCharacteristic, method
@@ -12,10 +12,10 @@ from ble.core.descriptor import GATTDescriptor
 from ble.constants import AUTH_PSK_ENV, SESSION_TIMEOUT, TX_POWER_DEFAULT
 
 def path_to_mac(device_path: str) -> str | None:
-    last = device_path.split("/")[-1]
-    if last.startswith("dev_"):
-        return last[4:].replace("_", ":")
-    return None
+	last = device_path.split("/")[-1]
+	if last.startswith("dev_"):
+		return last[4:].replace("_", ":")
+	return None
 
 class LCService(GATTService):
 	def __init__(self, path):
@@ -60,36 +60,56 @@ class LCService(GATTService):
 
 		super().__init__(path, "84bedf55-c9b2-4927-bd28-86cd93f91cfd", characteristics)
 		
-		threading.Thread(target=self._rssi_listener, daemon=True).start()
+		threading.Thread(target=self._poll_rssi, daemon=True).start()
 		
-	def _rssi_listener(self):
-		"""Subscribe to RSSI updates from C scanner via ZeroMQ"""
-		ctx = zmq.Context()
-		sock = ctx.socket(zmq.SUB)
-		sock.connect("tcp://127.0.0.1:5556")
-		sock.setsockopt_string(zmq.SUBSCRIBE, "")
-
+	def _poll_rssi(self):
+		"""Periodically fetch RSSI using hcitool for the active BLE device."""
 		while True:
 			try:
-				msg = sock.recv_string()
-				mac, rssi_str = msg.split()
-
-				if mac != self.active_device:
+				print("[RSSI POLLER] Active device:", self.active_device)
+				if not self.active_device:
+					time.sleep(0.5)
 					continue
 
-				print("[RSSI] Device:", mac, "RSSI:", rssi_str)
-				rssi = int(rssi_str)
+				r = subprocess.check_output(
+					["hcitool", "con"],
+					stderr=subprocess.STDOUT
+				).decode()
 
-				self.last_rssi = rssi
-				self.proximity_ok = rssi > -70  # threshold
+				print("[RSSI POLLER] hcitool con output:", r.strip())
 
-				# Notify GATT characteristic
-				if hasattr(self, "proximity_char"):
-					self.proximity_char.notify(bytes([1 if self.proximity_ok else 0]))
+				# Run hcitool to fetch RSSI for the connected device
+				result = subprocess.check_output(
+					["hcitool", "rssi", self.active_device],
+					stderr=subprocess.STDOUT
+				).decode()
 
+				print("[RSSI POLLER] hcitool output:", result.strip())
+
+				# Parse the output like: "RSSI return value: -65"
+				if "RSSI return value:" in result:
+					rssi = int(result.strip().split(":")[-1])
+					self.last_rssi = rssi
+					self.proximity_ok = rssi > -70  # adjust threshold as needed
+
+					print(f"[RSSI] {self.active_device} → {rssi} dBm, proximity_ok={self.proximity_ok}")
+
+					# Notify BLE clients of proximity change
+					if hasattr(self, "proximity_char"):
+						self.proximity_char.notify(bytes([1 if self.proximity_ok else 0]))
+
+				# time.sleep(3)  # poll interval (seconds)
+
+			except subprocess.CalledProcessError as e:
+				# hcitool fails if not connected
+				if b"Not connected" in e.output:
+					self.last_rssi = None
+					self.proximity_ok = False
+				print("[RSSI POLLER] hcitool error:", e.output.decode().strip())
+				time.sleep(0.5)
 			except Exception as e:
-				print("[RSSI LISTENER ERROR]", e)
-
+				print("[RSSI POLLER ERROR]", e)
+				time.sleep(0.5)
 
 	# ---------------- Lock state updates ----------------
 	def toggle_locked(self, locked):
@@ -109,9 +129,9 @@ class LCService(GATTService):
 		self.uptime_char.notify(self.uptime.to_bytes(4, 'little'))
 
 	# ---------------- Auth helpers ----------------
-	def start_auth_handshake(self, device_path: str):
+	def start_auth_handshake(self, device_mac: str):
 		"""Start a new handshake for a device, replacing previous session."""
-		self.active_device = device_path
+		self.active_device = device_mac
 		self.conn_counter = (self.conn_counter + 1) & 0xFFFFFFFF
 		self.session_auth = False
 		self.last_nonce = secrets.token_bytes(16)
@@ -121,9 +141,9 @@ class LCService(GATTService):
 		if hasattr(self, 'auth_char'):
 			self.auth_char.notify(payload)
 	
-	def is_session_valid(self, device_path: str) -> bool:
+	def is_session_valid(self, device_mac: str) -> bool:
 		"""Check if session is still valid (correct device + timeout not exceeded)."""
-		if device_path != self.active_device:
+		if device_mac != self.active_device:
 			return False
 		if not self.session_auth:
 			return False
@@ -136,9 +156,9 @@ class LCService(GATTService):
 			return False
 		return True
 
-	async def validate_auth(self, client_mac: bytes, device_path: str) -> bool:
+	async def validate_auth(self, client_mac: bytes, device_mac: str) -> bool:
 		"""Validate client HMAC only if from active device."""
-		if device_path != self.active_device:
+		if device_mac != self.active_device:
 			print("[AUTH] Denied: not active session device")
 			return False
 		if not self.last_nonce:
@@ -171,23 +191,21 @@ class AuthCharacteristic(GATTCharacteristic):
 	@method()
 	async def WriteValue(self, value: 'ay', options: 'a{sv}'):
 		value = bytes(value)
-		device_path = options.get("device", None)
-		print("[AUTH] Write from device:", device_path)
-		if not device_path:
+		if not options.get("device", None):
 			print("[AUTH] Missing device path in options")
 			self.notify(b"\x00")
 			return
-		
-		device_path = device_path.value
-		mac = path_to_mac(device_path)
+		device_path = options.get("device", None).value
+		device_mac = path_to_mac(device_path)		
+		print("[AUTH] Write from device:", device_mac)
 
 		# first time we see this device → start handshake
-		if self.service.active_device != mac or not self.service.last_nonce:
+		if self.service.active_device != device_mac or not self.service.last_nonce:
 			print("[AUTH] Starting new handshake")
-			self.service.start_auth_handshake(mac)
+			self.service.start_auth_handshake(device_mac)
 			return
 
-		ok = await self.service.validate_auth(value, mac)
+		ok = await self.service.validate_auth(value, device_mac)
 		self.notify(b"\x01" if ok else b"\x00")
 
 
@@ -202,18 +220,25 @@ class LockedCharacteristic(GATTCharacteristic):
 
 	@method()
 	def WriteValue(self, value: 'ay', options: 'a{sv}'):
-		device_path = options.get("device", None)
-		if not self.service.is_session_valid(device_path):
-			print("[AUTH] Write denied: invalid or expired session")
+		if not options.get("device", None):
+			print("[LOCK] Missing device path in options")
+			self.notify(b"\x00")
+			return
+		device_path = options.get("device", None).value
+		device_mac = path_to_mac(device_path)		
+		print("[LOCK] Write from device:", device_mac)
+
+		if not self.service.is_session_valid(device_mac):
+			print("[LOCK] Write denied: invalid or expired session")
 			return
 		# if not getattr(self.service, "proximity_ok", False):
-		#	 print("[AUTH] Write denied: device not in proximity")
+		#	 print("[LOCK] Write denied: device not in proximity")
 		#	 return
 		try:
 			new_state = bool(int(bytes(value)[0]))
 			self.service.toggle_locked(new_state)
 		except Exception:
-			print("[WRITE] Invalid payload for locked state")
+			print("[LOCK] Invalid payload for locked state")
 
 
 class BatteryLevelCharacteristic(GATTCharacteristic):
