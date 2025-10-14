@@ -4,7 +4,7 @@ import hmac
 import hashlib
 import secrets
 import threading
-import subprocess
+import zmq
 
 from ble.core.service import GATTService
 from ble.core.characteristic import GATTCharacteristic, method
@@ -60,56 +60,36 @@ class LCService(GATTService):
 
 		super().__init__(path, "84bedf55-c9b2-4927-bd28-86cd93f91cfd", characteristics)
 		
-		threading.Thread(target=self._poll_rssi, daemon=True).start()
+		threading.Thread(target=self._rssi_listener, daemon=True).start()
 		
-	def _poll_rssi(self):
-		"""Periodically fetch RSSI using hcitool for the active BLE device."""
+	def _rssi_listener(self):
+		"""Subscribe to RSSI updates from C scanner via ZeroMQ"""
+		ctx = zmq.Context()
+		sock = ctx.socket(zmq.SUB)
+		sock.connect("tcp://127.0.0.1:5556")
+		sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
 		while True:
 			try:
-				print("[RSSI POLLER] Active device:", self.active_device)
-				if not self.active_device:
-					time.sleep(0.5)
+				msg = sock.recv_string()
+				mac, rssi_str = msg.split()
+
+				if mac != self.active_device:
 					continue
 
-				r = subprocess.check_output(
-					["hcitool", "con"],
-					stderr=subprocess.STDOUT
-				).decode()
+				print("[RSSI] Device:", mac, "RSSI:", rssi_str)
+				rssi = int(rssi_str)
 
-				print("[RSSI POLLER] hcitool con output:", r.strip())
+				self.last_rssi = rssi
+				self.proximity_ok = rssi > -70  # threshold
 
-				# Run hcitool to fetch RSSI for the connected device
-				result = subprocess.check_output(
-					["hcitool", "rssi", self.active_device],
-					stderr=subprocess.STDOUT
-				).decode()
+				# Notify GATT characteristic
+				if hasattr(self, "proximity_char"):
+					self.proximity_char.notify(bytes([1 if self.proximity_ok else 0]))
 
-				print("[RSSI POLLER] hcitool output:", result.strip())
-
-				# Parse the output like: "RSSI return value: -65"
-				if "RSSI return value:" in result:
-					rssi = int(result.strip().split(":")[-1])
-					self.last_rssi = rssi
-					self.proximity_ok = rssi > -70  # adjust threshold as needed
-
-					print(f"[RSSI] {self.active_device} → {rssi} dBm, proximity_ok={self.proximity_ok}")
-
-					# Notify BLE clients of proximity change
-					if hasattr(self, "proximity_char"):
-						self.proximity_char.notify(bytes([1 if self.proximity_ok else 0]))
-
-				# time.sleep(3)  # poll interval (seconds)
-
-			except subprocess.CalledProcessError as e:
-				# hcitool fails if not connected
-				if b"Not connected" in e.output:
-					self.last_rssi = None
-					self.proximity_ok = False
-				print("[RSSI POLLER] hcitool error:", e.output.decode().strip())
-				time.sleep(0.5)
 			except Exception as e:
-				print("[RSSI POLLER ERROR]", e)
-				time.sleep(0.5)
+				print("[RSSI LISTENER ERROR]", e)
+
 
 	# ---------------- Lock state updates ----------------
 	def toggle_locked(self, locked):

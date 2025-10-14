@@ -8,146 +8,212 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 #include <signal.h>
-#include <zmq.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/time.h>
 
-int sock = -1;
-struct hci_filter old_filter, new_filter;
-static void *context = NULL;
-static void *publisher = NULL;
+#define MAX_CONNECTIONS 10
+#define POLLING_INTERVAL_US 200000 // 200ms = 5 polls per second
 
-void cleanup(int sig) {
-    if (sock >= 0) {
-        // Disable scanning
-		hci_le_set_scan_enable(sock, 0x00, 0x00, 1000);
-        // Restore old filter
-        setsockopt(sock, SOL_HCI, HCI_FILTER, &old_filter, sizeof(old_filter));
-        close(sock);
-    }
-    if (publisher) zmq_close(publisher);
-    if (context) zmq_ctx_destroy(context);
-    printf("\nSocket closed, scanning stopped (signal %d).\n", sig);
-    exit(0);
+// Creates a formatted timestamp string with milliseconds
+void get_timestamp(char *buffer, size_t len) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm *tm_info = localtime(&tv.tv_sec);
+    strftime(buffer, len, "%H:%M:%S", tm_info);
+    int ms = tv.tv_usec / 1000;
+    snprintf(buffer + 8, len - 8, ".%03d", ms);
 }
 
-char *get_device_name(const uint8_t *data, size_t length) {
-	size_t offset = 0;
-    static char name[256]; // static buffer for simplicity
-    memset(name, 0, sizeof(name));
+// Struct to hold info about a connected device
+struct connected_device {
+    uint16_t handle;
+    bdaddr_t addr;
+    uint8_t addr_type;
+};
 
-    while (offset < length) {
-        uint8_t field_len = data[offset];
-        if (field_len == 0) break;  // no more fields
+// Global state
+static int sock = -1;
+static volatile int running = 1;
+struct connected_device connection_list[MAX_CONNECTIONS];
+pthread_mutex_t list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-        if (offset + field_len >= length) break; // safety check
-
-        uint8_t ad_type = data[offset + 1];
-
-        if (ad_type == 0x09 || ad_type == 0x08) { // complete or short name
-            memcpy(name, &data[offset + 2], field_len - 1);
-            name[field_len - 1] = '\0';
-            return name;
+// Helper to add a connection to our list
+void add_connection(uint16_t handle, bdaddr_t *addr, uint8_t type) {
+    char ts[20];
+    get_timestamp(ts, sizeof(ts));
+    pthread_mutex_lock(&list_mutex);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_list[i].handle == 0) { // Find empty slot
+            connection_list[i].handle = handle;
+            bacpy(&connection_list[i].addr, addr);
+            connection_list[i].addr_type = type;
+            char addr_str[18];
+            ba2str(addr, addr_str);
+            printf("%s >> DEVICE CONNECTED: Handle %d, Address %s\n", ts, handle, addr_str);
+            fflush(stdout);
+            break;
         }
-
-        offset += field_len + 1; // move to next field
     }
+    pthread_mutex_unlock(&list_mutex);
+}
 
-    return NULL; // no name found
+// Helper to remove a connection from our list
+void remove_connection(uint16_t handle) {
+    char ts[20];
+    get_timestamp(ts, sizeof(ts));
+    pthread_mutex_lock(&list_mutex);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_list[i].handle == handle) {
+            char addr_str[18];
+            ba2str(&connection_list[i].addr, addr_str);
+            printf("%s << DEVICE DISCONNECTED: Handle %d, Address %s\n", ts, handle, addr_str);
+            fflush(stdout);
+            memset(&connection_list[i], 0, sizeof(struct connected_device));
+            break;
+        }
+    }
+    pthread_mutex_unlock(&list_mutex);
+}
+
+// The background thread for polling RSSI
+void *rssi_poll_thread(void *arg) {
+    char ts[20];
+    get_timestamp(ts, sizeof(ts));
+    printf("%s RSSI polling thread started.\n", ts);
+    fflush(stdout);
+
+    while (running) {
+        // More robust timer to maintain a consistent rate
+        struct timeval start_time, end_time;
+        gettimeofday(&start_time, NULL);
+
+        pthread_mutex_lock(&list_mutex);
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_list[i].handle != 0) {
+                int8_t rssi;
+                if (hci_read_rssi(sock, connection_list[i].handle, &rssi, 1000) < 0) {
+                    get_timestamp(ts, sizeof(ts));
+                    // Don't use perror as it goes to stderr, which might not be visible
+                    printf("%s [ERROR] Failed to read RSSI for handle %d: %s\n", ts, connection_list[i].handle, strerror(errno));
+                    fflush(stdout);
+                    continue;
+                }
+                
+                char addr_str[18];
+                ba2str(&connection_list[i].addr, addr_str);
+                get_timestamp(ts, sizeof(ts));
+                printf("%s    [RSSI] %s -> %d dBm\n", ts, addr_str, rssi);
+                fflush(stdout);
+            }
+        }
+        pthread_mutex_unlock(&list_mutex);
+
+        gettimeofday(&end_time, NULL);
+        long elapsed_us = (end_time.tv_sec - start_time.tv_sec) * 1000000L + (end_time.tv_usec - start_time.tv_usec);
+        
+        if (elapsed_us < POLLING_INTERVAL_US) {
+            usleep(POLLING_INTERVAL_US - elapsed_us);
+        }
+    }
+    get_timestamp(ts, sizeof(ts));
+    printf("%s RSSI polling thread finished.\n", ts);
+    fflush(stdout);
+    return NULL;
+}
+
+void cleanup(int sig) {
+    printf("\nCleaning up...\n");
+    running = 0;
+    if (sock >= 0) {
+        pthread_mutex_lock(&list_mutex);
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_list[i].handle != 0) {
+				printf("Disconnecting handle %d...\n", connection_list[i].handle);
+				fflush(stdout);
+                hci_disconnect(sock, connection_list[i].handle, HCI_OE_USER_ENDED_CONNECTION, 1000);
+            }
+        }
+        pthread_mutex_unlock(&list_mutex);
+        close(sock);
+    }
+    exit(0);
 }
 
 int main() {
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
-    int dev_id;
-    socklen_t olen;
 
-    // 1. Get the first available Bluetooth adapter
-    dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("No Bluetooth Adapter Available");
-        exit(1);
-    }
+    memset(connection_list, 0, sizeof(connection_list));
 
-    // 2. Open a raw HCI socket to the adapter
+    int dev_id = hci_get_route(NULL);
     sock = hci_open_dev(dev_id);
     if (sock < 0) {
-        perror("HCI device open failed");
+        perror("Failed to open HCI socket");
         exit(1);
     }
 
-    // 3. Save the current socket filter (so we can restore it later)
-    olen = sizeof(old_filter);
-    if (getsockopt(sock, SOL_HCI, HCI_FILTER, &old_filter, &olen) < 0) {
-        perror("Could not get socket options");
+    struct hci_filter flt;
+    hci_filter_clear(&flt);
+    hci_filter_set_ptype(HCI_EVENT_PKT, &flt);
+    hci_filter_set_event(EVT_LE_META_EVENT, &flt);
+    hci_filter_set_event(EVT_DISCONN_COMPLETE, &flt);
+    if (setsockopt(sock, SOL_HCI, HCI_FILTER, &flt, sizeof(flt)) < 0) {
+        perror("Failed to set HCI filter");
         close(sock);
         exit(1);
     }
 
-    // 4. Set new HCI filter: we only want LE Meta Events
-    hci_filter_clear(&new_filter);
-    hci_filter_set_ptype(HCI_EVENT_PKT, &new_filter);
-    hci_filter_set_event(EVT_LE_META_EVENT, &new_filter);
-    if (setsockopt(sock, SOL_HCI, HCI_FILTER, &new_filter, sizeof(new_filter)) < 0) {
-        perror("Could not set socket options");
+    pthread_t poll_thread_id;
+    if (pthread_create(&poll_thread_id, NULL, rssi_poll_thread, NULL)) {
+        perror("Failed to create RSSI poll thread");
         close(sock);
         exit(1);
     }
 
-    // 5. Set scan parameters (active scan, interval, window)
-    if (hci_le_set_scan_parameters(sock, 0x01, 0x10, 0x10, 0x00, 0x00, 1000) < 0) {
-        perror("Set scan parameters failed");
-        close(sock);
-        exit(1);
-    }
+    char ts[20];
+    get_timestamp(ts, sizeof(ts));
+    printf("%s Listening for LE connection events...\n", ts);
+    fflush(stdout);
 
-    // 6. Enable scanning
-    if (hci_le_set_scan_enable(sock, 0x01, 0x00, 1000) < 0) {
-        perror("Enable scan failed");
-        close(sock);
-        exit(1);
-    }
-
-    printf("Scanning for BLE devices...\n");
-
-	// ZeroMQ publisher
-    context = zmq_ctx_new();
-    publisher = zmq_socket(context, ZMQ_PUB);
-    zmq_bind(publisher, "tcp://127.0.0.1:5556");
-    printf("Publishing BLE devices on tcp://127.0.0.1:5556 ...\n");
-
-    // 7. Read events in a loop
-    unsigned char buf[HCI_MAX_EVENT_SIZE];
-    while (1) {
+    while (running) {
+        unsigned char buf[HCI_MAX_EVENT_SIZE];
         int len = read(sock, buf, sizeof(buf));
         if (len < 0) {
             if (errno == EINTR) continue;
-            perror("Read failed");
+            perror("HCI read failed");
             break;
         }
 
-        // 8. Extract LE Meta Event
-        evt_le_meta_event *meta = (evt_le_meta_event *)(buf + (1 + HCI_EVENT_HDR_SIZE));
-        if (meta->subevent != EVT_LE_ADVERTISING_REPORT) continue;
+        if (buf[0] != HCI_EVENT_PKT) continue;
+        
+        get_timestamp(ts, sizeof(ts));
+        hci_event_hdr *hdr = (hci_event_hdr *)(buf + 1);
+        printf("%s Received HCI Event: 0x%02X\n", ts, hdr->evt);
+        fflush(stdout);
 
-        // 9. Parse advertising reports
-        uint8_t reports_count = meta->data[0];
-        le_advertising_info *info = (le_advertising_info *)(meta->data + 1);
-
-        for (int i = 0; i < reports_count; i++) {
-            char addr[18];
-            ba2str(&info->bdaddr, addr);
-            int8_t rssi = (int8_t)info->data[info->length];
-
-            char msg[64];
-            snprintf(msg, sizeof(msg), "%s %d", addr, rssi);
-
-            zmq_send(publisher, msg, strlen(msg), 0);
-            printf("Sent: %s\n", msg);
-
-            // Move to next report in case of multiple
-            info = (le_advertising_info *)((uint8_t *)info + info->length + 2 + 1);
+        switch (hdr->evt) {
+            case EVT_LE_META_EVENT: {
+                evt_le_meta_event *meta = (evt_le_meta_event *)(buf + 1 + HCI_EVENT_HDR_SIZE);
+                if (meta->subevent == EVT_LE_CONN_COMPLETE || meta->subevent == 0x0A) {
+                    evt_le_connection_complete *cc = (evt_le_connection_complete *)meta->data;
+                    if (cc->status == 0) {
+                        add_connection(btohs(cc->handle), &cc->peer_bdaddr, cc->peer_bdaddr_type);
+                    }
+                } 
+                break;
+            }
+            case EVT_DISCONN_COMPLETE: {
+                evt_disconn_complete *dc = (evt_disconn_complete *)(buf + 1 + HCI_EVENT_HDR_SIZE);
+                if (dc->status == 0) {
+                    remove_connection(btohs(dc->handle));
+                }
+                break;
+            }
         }
     }
 
+    pthread_join(poll_thread_id, NULL);
     cleanup(0);
     return 0;
 }
