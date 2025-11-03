@@ -133,8 +133,10 @@ def _expected_token(session_key, slot):
 
 def validate_token(token, session_key):
 	if not session_key:
+		print("No session key available; rejecting token")
 		return False
 	if time.time() >= SESSION_EXPIRY:
+		print(f"Session key expired at {SESSION_EXPIRY}; rejecting token")
 		return False
 
 	current_slot = int(time.time() // ADVERT_INTERVAL)
@@ -145,6 +147,8 @@ def validate_token(token, session_key):
 		expected = _expected_token(session_key, slot)
 		if hmac.compare_digest(token, expected):
 			return True
+		else:
+			print("Token mismatch for slot", slot)
 	return False
 
 
@@ -166,11 +170,11 @@ def detection_callback(device, advertisement_data):
 			if validate_token(token, SESSION_KEY):
 				print("Token valid! Unlocking...")
 			else:
-				print("Invalid token")
+				print(f"Invalid token: {token.hex()}")
 		else:
-			print("No token in manufacturing data")
+			pass
 	else:
-		print("No manufacturing data")
+		pass
 
 
 async def main():

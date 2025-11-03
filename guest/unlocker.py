@@ -106,6 +106,7 @@ class LockAdvertisement(Advertisement):
 	def __init__(self, session_key: bytes):
 		self.session_key = session_key
 		token = generate_token(self.session_key, PHONE_MAC)
+		print(f"[ADV] Generated token: {token.hex()}")
 		super().__init__(
 			localName="BLELock",
 			serviceUUIDs=["180D"],

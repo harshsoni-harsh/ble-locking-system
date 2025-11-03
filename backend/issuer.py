@@ -28,7 +28,8 @@ with open(KEYS_DIR / "backend_private.pem", "rb") as handle:
 	)
 
 LOCK_PUBLIC_KEYS: Dict[str, Path] = {
-	"lock_01": KEYS_DIR / "lock_01_public.pem",
+    p.stem.replace("_public", ""): p
+    for p in KEYS_DIR.glob("*_public.pem")
 }
 
 
@@ -118,6 +119,7 @@ def on_message(client, userdata, msg):
 		return
 
 	device_id = payload.get("lock_id")
+	print(payload.get("curr_time")) # time difference between user and backend utc time
 	if device_id and device_id in LOCK_PUBLIC_KEYS:
 		issue_session_key(device_id)
 	else:
