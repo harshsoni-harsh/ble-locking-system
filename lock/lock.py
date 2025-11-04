@@ -1,181 +1,99 @@
 import asyncio
 import base64
-import binascii
-import hmac
-import hashlib
 import json
-import time
-from pathlib import Path
-from typing import cast
+import logging
+from typing import Optional
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 from bleak import BleakScanner
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.serialization import (
-	load_pem_private_key,
-	load_pem_public_key,
-)
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-KEYS_DIR = ROOT_DIR / "keys"
+from lock.core import (
+	MANUFACTURER_ID,
+	SessionError,
+	SessionRecord,
+	extract_session,
+	has_expired,
+	load_keys,
+	matches_mac,
+	normalize_mac,
+	validate_token,
+)
 
 MQTT_BROKER = "10.0.15.108"
 MQTT_PORT = 1883
 LOCK_ID = "lock_01"
-SESSION_KEY = None
-SESSION_EXPIRY = 0
-
 RSSI_THRESHOLD = -70
-EXPECTED_PHONE_MAC = "B4:8C:9D:8D:83:90"
-ADVERT_INTERVAL = 30  # seconds; must stay in sync with unlocker
-ROLLING_WINDOW = 1  # accept current and previous slot to absorb small clock drift
 
-with open(KEYS_DIR / "backend_public.pem", "rb") as handle:
-	BACKEND_PUBLIC_KEY = cast(
-		rsa.RSAPublicKey,
-		load_pem_public_key(handle.read(), backend=default_backend()),
-	)
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-with open(KEYS_DIR / f"{LOCK_ID}_private.pem", "rb") as handle:
-	LOCK_PRIVATE_KEY = cast(
-		rsa.RSAPrivateKey,
-		load_pem_private_key(handle.read(), password=None, backend=default_backend()),
-	)
+BACKEND_PUBLIC_KEY, LOCK_PRIVATE_KEY = load_keys(LOCK_ID)
 
+SESSION: Optional[SessionRecord] = None
 
 def on_message(client, userdata, msg):
-	global SESSION_KEY, SESSION_EXPIRY
-	print(f"Received MQTT message on {msg.topic}")
+	global SESSION
+	logger.info("Received MQTT message on %s", msg.topic)
 
 	try:
 		payload = json.loads(msg.payload.decode())
 	except json.JSONDecodeError:
-		print("Malformed JSON payload; ignoring")
-		return
-
-	signature_b64 = payload.pop("signature", None)
-	if not signature_b64:
-		print("Payload missing signature; ignoring")
+		logger.error("Malformed JSON payload; ignoring")
 		return
 
 	try:
-		signature = base64.b64decode(signature_b64)
-	except (ValueError, binascii.Error):
-		print("Malformed signature encoding; ignoring payload")
+		session = extract_session(payload, LOCK_ID, BACKEND_PUBLIC_KEY, LOCK_PRIVATE_KEY)
+	except SessionError as exc:
+		logger.error("Invalid session payload: %s", exc)
 		return
 
-	signed_payload = {
-		key: payload.get(key)
-		for key in ("device_id", "session_key", "expiry", "nonce")
-		if key in payload
-	}
-
-	if signed_payload.get("device_id") != LOCK_ID:
-		print("Payload target mismatch; ignoring")
-		return
-
-	if not all(k in signed_payload for k in ("session_key", "expiry", "nonce")):
-		print("Payload missing required fields; ignoring")
-		return
-
-	canonical = json.dumps(signed_payload, separators=(",", ":")).encode()
-	try:
-		BACKEND_PUBLIC_KEY.verify(
-			signature,
-			canonical,
-			padding.PSS(
-				mgf=padding.MGF1(hashes.SHA256()),
-				salt_length=padding.PSS.MAX_LENGTH,
-			),
-			hashes.SHA256(),
+	SESSION = session
+	key_b64 = base64.b64encode(session.key).decode()
+	logger.info(
+		"Decrypted session key: %s (expires %s, nonce %s)",
+		key_b64,
+		session.expiry,
+		session.nonce,
+	)
+	if session.offset:
+		logger.info(
+			"Applied clock offset %s seconds for session; phone=%s",
+			session.offset,
+			session.phone_mac,
 		)
-	except InvalidSignature:
-		print("Signature verification failed; ignoring payload")
-		return
-
-	try:
-		encrypted_key = base64.b64decode(payload["session_key"])
-	except (KeyError, binascii.Error, ValueError):
-		print("Invalid encrypted session key; ignoring")
-		return
-
-	session_key = LOCK_PRIVATE_KEY.decrypt(
-		encrypted_key,
-		padding.OAEP(
-			mgf=padding.MGF1(algorithm=hashes.SHA256()),
-			algorithm=hashes.SHA256(),
-			label=None,
-		),
-	)
-
-	try:
-		expiry = int(payload["expiry"])
-	except (KeyError, ValueError, TypeError):
-		print("Invalid expiry in payload; ignoring")
-		return
-
-	nonce = payload.get("nonce")
-	print(
-		f"Decrypted session key: {base64.b64encode(session_key).decode()} (expires {expiry}, nonce {nonce})"
-	)
-	SESSION_KEY = session_key
-	SESSION_EXPIRY = expiry
-
-
-def _expected_token(session_key, slot):
-	message = EXPECTED_PHONE_MAC.encode() + str(slot).encode()
-	return hmac.new(session_key, message, hashlib.sha256).digest()[:16]
-
-
-def validate_token(token, session_key):
-	if not session_key:
-		print("No session key available; rejecting token")
-		return False
-	if time.time() >= SESSION_EXPIRY:
-		print(f"Session key expired at {SESSION_EXPIRY}; rejecting token")
-		return False
-
-	current_slot = int(time.time() // ADVERT_INTERVAL)
-	for offset in range(ROLLING_WINDOW + 1):
-		slot = current_slot - offset
-		if slot < 0:
-			continue
-		expected = _expected_token(session_key, slot)
-		if hmac.compare_digest(token, expected):
-			return True
-		else:
-			print("Token mismatch for slot", slot)
-	return False
-
+	else:
+		logger.info("Session registered for phone=%s", session.phone_mac)
 
 def detection_callback(device, advertisement_data):
-	if SESSION_KEY is None:
+	session = SESSION
+	if session is None:
 		return
 
-	# print(f"Detected device: {device.name}, address: {device.address}")
-	if advertisement_data.manufacturer_data:
-		company_id = 0xFFFF
-		if company_id in advertisement_data.manufacturer_data:
-			token = advertisement_data.manufacturer_data[company_id]
-			rssi = advertisement_data.rssi
-			is_nearby = rssi > RSSI_THRESHOLD
-			print(f"RSSI: {rssi}, Threshold: {RSSI_THRESHOLD}")
-			if not is_nearby:
-				print("Device too far; ignoring")
-				return
-			if validate_token(token, SESSION_KEY):
-				print("Token valid! Unlocking...")
-			else:
-				print(f"Invalid token: {token.hex()}")
-		else:
-			pass
-	else:
-		pass
+	token_map = advertisement_data.manufacturer_data or {}
+	if MANUFACTURER_ID not in token_map:
+		return
 
+	token = token_map[MANUFACTURER_ID]
+	rssi = advertisement_data.rssi
+	logger.debug("RSSI %s, threshold %s", rssi, RSSI_THRESHOLD)
+	if rssi is not None and rssi <= RSSI_THRESHOLD:
+		logger.info("Device %s below RSSI threshold; ignoring", device.address)
+		return
+
+	device_mac = normalize_mac(device.address)
+	if not matches_mac(session, device_mac):
+		logger.info("Ignoring advertisement from unexpected device %s", device_mac)
+		return
+
+	if has_expired(session):
+		logger.warning("Session key expired at %s; rejecting token", session.expiry)
+		return
+
+	if validate_token(token, session):
+		logger.info("Token valid for %s; unlocking", device_mac)
+	else:
+		logger.warning("Invalid token from %s: %s", device_mac, token.hex())
 
 async def main():
 	client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
@@ -184,22 +102,21 @@ async def main():
 	topic = f"locks/{LOCK_ID}/session"
 	client.subscribe(topic)
 	client.loop_start()
-	print(f"Subscribed to {topic} for session keys")
+	logger.info("Subscribed to %s for session keys", topic)
 
 	scanner = BleakScanner(detection_callback=detection_callback)
 	await scanner.start()
-	print("BLE scanner started")
+	logger.info("BLE scanner started")
 
 	try:
 		while True:
 			await asyncio.sleep(1)
 	except KeyboardInterrupt:
-		print("Stopping...")
+		logger.info("Stopping...")
 	finally:
 		client.loop_stop()
 		client.disconnect()
 		await scanner.stop()
-
 
 if __name__ == "__main__":
 	asyncio.run(main())
