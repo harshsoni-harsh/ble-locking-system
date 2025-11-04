@@ -1,12 +1,11 @@
 import asyncio
 import base64
 import json
+import logging
 import hmac
 import hashlib
 import time
 from typing import Any, Dict, Optional
-
-PHONE_MAC_OVERRIDE: Optional[str] = None
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
@@ -17,6 +16,11 @@ from dbus_next.errors import DBusError
 from dbus_next.message import Message
 from dbus_next.signature import Variant
 from dbus_next.service import dbus_property
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+PHONE_MAC_OVERRIDE: Optional[str] = None
 
 LOCK_ID = "lock_01"
 MQTT_BROKER = "10.0.15.108"
@@ -30,7 +34,7 @@ session_key_data = None
 def on_message(client, userdata, msg):
 	"""Handles incoming MQTT messages (session key responses)."""
 	global session_key_data
-	print(f"[MQTT] Received session key on {msg.topic}")
+	logger.info("Received session key on %s", msg.topic)
 	data = json.loads(msg.payload.decode())
 	session_key_data = data
 
@@ -43,8 +47,8 @@ def get_session_key(lock_id: str, phone_mac: str):
 
 	try:
 		client.connect(MQTT_BROKER, MQTT_PORT, 60)
-	except ConnectionRefusedError:
-		raise ConnectionError(f"Failed to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
+	except ConnectionRefusedError as exc:
+		raise ConnectionError(f"Failed to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}") from exc
 
 	guest_topic = f"guests/{lock_id}/session"
 	request_topic = "backend/session_requests"
@@ -55,7 +59,7 @@ def get_session_key(lock_id: str, phone_mac: str):
 		client.subscribe(guest_topic, qos=1)
 		publish_result = client.publish(request_topic, request_payload, qos=1)
 		publish_result.wait_for_publish()
-		print(f"[MQTT] Requested session key for {lock_id}")
+		logger.info("Requested session key for %s", lock_id)
 
 		start = time.time()
 		timeout = 10  # seconds
@@ -66,21 +70,25 @@ def get_session_key(lock_id: str, phone_mac: str):
 		client.loop_stop()
 		client.disconnect()
 
-	if session_key_data:
-		resp_mac = session_key_data.get("phone_mac")
-		if resp_mac and resp_mac.upper() != phone_mac:
-			raise ValueError(f"Received session for unexpected phone {resp_mac}")
-		session_key = base64.b64decode(session_key_data["session_key"])
-		expiry = session_key_data.get("expiry")
-		nonce = session_key_data.get("nonce")
-		print(f"[MQTT] Session key received. Expires: {expiry}, Nonce: {nonce}")
-		return session_key, expiry
-	raise TimeoutError("No session key received from backend within timeout")
+		if session_key_data:
+			phone_mac_received = session_key_data.get("phone_mac")
+			if phone_mac_received:
+				logger.info("Backend included phone MAC in guest payload; ignoring per policy.")
+			session_key = base64.b64decode(session_key_data["session_key"])
+			expiry = session_key_data.get("expiry")
+			nonce = session_key_data.get("nonce")
+			logger.info("Session key received. Expires: %s, nonce: %s", expiry, nonce)
+			return session_key, expiry, nonce
+		raise TimeoutError("No session key received from backend within timeout")
 
-def generate_token(session_key: bytes, mac: str) -> bytes:
-	"""Generate rolling HMAC token using session key + timestamp."""
+def generate_token(session_key: bytes, nonce: Optional[str]) -> bytes:
+	"""Generate rolling HMAC token using session key, nonce, and timestamp."""
 	ts = int(time.time() // ADVERT_INTERVAL)
-	msg = mac.encode() + str(ts).encode()
+	components = []
+	if nonce:
+		components.append(nonce.encode())
+	components.append(str(ts).encode())
+	msg = b"".join(components)
 	return hmac.new(session_key, msg, hashlib.sha256).digest()[:16]
 
 async def get_first_adapter(bus) -> Adapter:
@@ -105,8 +113,6 @@ async def get_first_adapter(bus) -> Adapter:
 
 	raise ValueError("No bluetooth adapters could be found.")
 
-
-
 async def _detect_phone_mac() -> str:
 	bus = await get_message_bus()
 	try:
@@ -119,21 +125,19 @@ async def _detect_phone_mac() -> str:
 		except Exception:
 			pass
 
-
 def resolve_phone_mac() -> str:
 	if PHONE_MAC_OVERRIDE:
 		return PHONE_MAC_OVERRIDE.upper()
 	mac = asyncio.run(_detect_phone_mac())
-	print(f"[SYS] Detected adapter MAC: {mac}")
+	logger.info("Detected adapter MAC: %s", mac)
 	return mac
 
-
 class LockAdvertisement(Advertisement):
-	def __init__(self, session_key: bytes, phone_mac: str):
+	def __init__(self, session_key: bytes, nonce: Optional[str]):
 		self.session_key = session_key
-		self.phone_mac = phone_mac
-		token = generate_token(self.session_key, self.phone_mac)
-		print(f"[ADV] Generated token: {token.hex()}")
+		self.nonce = nonce
+		token = generate_token(self.session_key, self.nonce)
+		logger.debug("Generated advertisement token: %s", token.hex())
 		super().__init__(
 			localName="BLELock",
 			serviceUUIDs=["180D"],
@@ -156,9 +160,9 @@ class LockAdvertisement(Advertisement):
 				raise
 
 	def update_token(self):
-		token = generate_token(self.session_key, self.phone_mac)
+		token = generate_token(self.session_key, self.nonce)
 		self._manufacturerData[MANUFACTURER_ID] = Variant("ay", token)
-		print(f"[ADV] Updated token: {token.hex()}")
+		logger.debug("Updated advertisement token: %s", token.hex())
 
 	@dbus_property(PropertyAccess.READWRITE)
 	def TxPower(self) -> "n":  # type: ignore[override]
@@ -168,24 +172,24 @@ class LockAdvertisement(Advertisement):
 	def TxPower(self, value: "n") -> None:  # type: ignore[override]
 		return
 
-async def advertise_loop(session_key: bytes, expiry: int | float, phone_mac: str):
+async def advertise_loop(session_key: bytes, expiry: int | float, nonce: Optional[str]):
 	"""Main async advertising loop."""
 	bus = await get_message_bus()
 	try:
 		adapter = await get_first_adapter(bus)
 		adapter_name = await adapter.get_name()
-		advertiser = LockAdvertisement(session_key, phone_mac)
+		advertiser = LockAdvertisement(session_key, nonce)
 		await advertiser.start(bus, adapter)
-	except Exception as e:
-		print(f"[BLE] Failed to start advertising: {e}")
+	except Exception as exc:
+		logger.error("Failed to start advertising: %s", exc)
 		return
-	print(f"[BLE] Advertising started on adapter {adapter_name}...")
+	logger.info("Advertising started on adapter %s", adapter_name)
 
 	try:
 		while True:
 			remaining = expiry - time.time()
 			if remaining <= 0:
-				print("[BLE] Session key expired; stopping advertising.")
+				logger.info("Session key expired; stopping advertising")
 				break
 
 			await asyncio.sleep(min(ADVERT_INTERVAL, max(0.5, remaining)))
@@ -195,7 +199,7 @@ async def advertise_loop(session_key: bytes, expiry: int | float, phone_mac: str
 	except asyncio.CancelledError:
 		pass
 	finally:
-		print("[BLE] Stopping advertising...")
+		logger.info("Stopping advertising")
 		try:
 			await advertiser.stop(adapter)
 		except Exception:
@@ -204,12 +208,12 @@ async def advertise_loop(session_key: bytes, expiry: int | float, phone_mac: str
 if __name__ == "__main__":
 	try:
 		phone_mac = resolve_phone_mac()
-		print(f"[SYS] Using phone MAC {phone_mac}")
-		print("[SYS] Requesting session key from backend...")
-		session_key, expiry = get_session_key(LOCK_ID, phone_mac)
-		print(f"[SYS] Session key (base64): {base64.b64encode(session_key).decode()}")
-		asyncio.run(advertise_loop(session_key, expiry or 0, phone_mac))
+		logger.info("Using phone MAC %s", phone_mac)
+		logger.info("Requesting session key from backend...")
+		session_key, expiry, nonce = get_session_key(LOCK_ID, phone_mac)
+		logger.info("Session key (base64): %s", base64.b64encode(session_key).decode())
+		asyncio.run(advertise_loop(session_key, expiry or 0, nonce))
 	except KeyboardInterrupt:
-		print("\n[SYS] Script stopped by user.")
-	except Exception as e:
-		print(f"\n[ERR] {e}")
+		logger.info("Script stopped by user")
+	except Exception as exc:
+		logger.exception("Guest unlocker encountered an error: %s", exc)

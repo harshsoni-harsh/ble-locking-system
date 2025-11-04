@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -21,6 +22,9 @@ KEYS_DIR = ROOT_DIR / "keys"
 MQTT_BROKER = "10.0.15.108"
 MQTT_PORT = 1883
 
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
 with open(KEYS_DIR / "backend_private.pem", "rb") as handle:
 	BACKEND_PRIVATE_KEY = cast(
 		rsa.RSAPrivateKey,
@@ -32,10 +36,8 @@ LOCK_PUBLIC_KEYS: Dict[str, Path] = {
     for p in KEYS_DIR.glob("*_public.pem")
 }
 
-
 def generate_session_key() -> bytes:
 	return os.urandom(32)
-
 
 def load_lock_public_key(device_id: str) -> rsa.RSAPublicKey:
 	key_path = LOCK_PUBLIC_KEYS.get(device_id)
@@ -46,7 +48,6 @@ def load_lock_public_key(device_id: str) -> rsa.RSAPublicKey:
 			rsa.RSAPublicKey,
 			load_pem_public_key(handle.read(), backend=default_backend()),
 		)
-
 
 def encrypt_for_lock(session_key: bytes, device_id: str) -> bytes:
 	pubkey = load_lock_public_key(device_id)
@@ -59,7 +60,6 @@ def encrypt_for_lock(session_key: bytes, device_id: str) -> bytes:
 		),
 	)
 
-
 def sign_payload(payload: bytes) -> str:
 	signature = BACKEND_PRIVATE_KEY.sign(
 		payload,
@@ -70,7 +70,6 @@ def sign_payload(payload: bytes) -> str:
 		hashes.SHA256(),
 	)
 	return base64.b64encode(signature).decode()
-
 
 def issue_session_key(
 	device_id: str,
@@ -103,32 +102,29 @@ def issue_session_key(
 	try:
 		topic = f"locks/{device_id}/session"
 		client.publish(topic, final_payload, qos=1).wait_for_publish()
-		print(f"Published encrypted session key for {device_id} to {topic}")
+		logger.info("Published encrypted session key for %s to %s", device_id, topic)
 
 		guest_payload = {
 			"session_key": base64.b64encode(session_key).decode(),
 			"expiry": expiry_ts,
 			"nonce": nonce,
 		}
-		if phone_mac:
-			guest_payload["phone_mac"] = phone_mac
 		if clock_offset is not None:
 			guest_payload["clock_offset"] = clock_offset
 		guest_topic = f"guests/{device_id}/session"
 		client.publish(guest_topic, json.dumps(guest_payload), qos=1).wait_for_publish()
-		print(f"Published plain session key for {device_id} to {guest_topic}")
+		logger.info("Published plain session key for %s to %s", device_id, guest_topic)
 	finally:
 		client.loop_stop()
 		client.disconnect()
 	return session_key, expiry_ts, nonce
 
-
 def on_message(client, userdata, msg):
-	print(f"Received request on {msg.topic}")
+	logger.info("Received request on %s", msg.topic)
 	try:
 		payload = json.loads(msg.payload.decode())
 	except json.JSONDecodeError:
-		print("Invalid request payload")
+		logger.error("Invalid request payload")
 		return
 
 	device_id = payload.get("lock_id")
@@ -137,7 +133,12 @@ def on_message(client, userdata, msg):
 	clock_offset = 0
 	if isinstance(client_time, (int, float)):
 		clock_offset = int(client_time) - server_time
-		print(f"Clock offset for request: client={int(client_time)} server={server_time} offset={clock_offset}")
+		logger.info(
+			"Clock offset for request: client=%s server=%s offset=%s",
+			int(client_time),
+			server_time,
+			clock_offset,
+		)
 	if device_id and device_id in LOCK_PUBLIC_KEYS:
 		phone_mac = payload.get("phone_mac")
 		issue_session_key(
@@ -146,8 +147,7 @@ def on_message(client, userdata, msg):
 			clock_offset=clock_offset,
 		)
 	else:
-		print("Invalid request")
-
+		logger.error("Invalid request")
 
 def main():
 	client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
@@ -156,15 +156,18 @@ def main():
 		client.connect(MQTT_BROKER, MQTT_PORT, 60)
 		request_topic = "backend/session_requests"
 		client.subscribe(request_topic)
-		print(f"[SYS] Backend listening for session requests on {request_topic}")
+		logger.info("Backend listening for session requests on %s", request_topic)
 		client.loop_forever()
 	except ConnectionRefusedError:
-		print("[MQTT] Failed to connect to MQTT broker. Make sure the broker is running on 10.0.15.108:1883")
+		logger.error(
+			"Failed to connect to MQTT broker. Make sure the broker is running on %s:%s",
+			MQTT_BROKER,
+			MQTT_PORT,
+		)
 	except KeyboardInterrupt:
-		print("\n[SYS] Script stopped by user.")
-	except Exception as e:
-		print(f"\n[ERR] {e}")
-
+		logger.info("Script stopped by user.")
+	except Exception as exc:
+		logger.exception("Unhandled error in backend issuer: %s", exc)
 
 if __name__ == "__main__":
 	main()

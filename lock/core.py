@@ -23,10 +23,8 @@ ADVERT_INTERVAL = 30
 ROLLING_WINDOW = 1
 MANUFACTURER_ID = 0xFFFF
 
-
 class SessionError(Exception):
     pass
-
 
 @dataclass
 class SessionRecord:
@@ -36,12 +34,10 @@ class SessionRecord:
     phone_mac: Optional[str] = None
     nonce: Optional[str] = None
 
-
 def normalize_mac(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     return str(value).upper()
-
 
 def load_keys(lock_id: str) -> Tuple[rsa.RSAPublicKey, rsa.RSAPrivateKey]:
     with open(KEYS_DIR / "backend_public.pem", "rb") as handle:
@@ -55,7 +51,6 @@ def load_keys(lock_id: str) -> Tuple[rsa.RSAPublicKey, rsa.RSAPrivateKey]:
             load_pem_private_key(handle.read(), password=None, backend=default_backend()),
         )
     return backend_public, lock_private
-
 
 def _canonical_payload(payload: dict, fields: Sequence[str]) -> bytes:
     subset = {key: payload.get(key) for key in fields if key in payload}
@@ -140,7 +135,6 @@ def extract_session(
         nonce=nonce,
     )
 
-
 def has_expired(session: SessionRecord, now: Optional[float] = None) -> bool:
     if now is None:
         now = time.time()
@@ -157,11 +151,9 @@ def iter_slots(session: SessionRecord, now: Optional[float] = None) -> Iterable[
         if slot >= 0:
             yield slot
 
-
 def expected_token(session: SessionRecord, slot: int) -> bytes:
-    if not session.phone_mac:
-        raise SessionError("missing phone mac for session")
-    message = session.phone_mac.encode() + str(slot).encode()
+    nonce_bytes = (session.nonce or "").encode()
+    message = nonce_bytes + str(slot).encode()
     return hmac.new(session.key, message, hashlib.sha256).digest()[:16]
 
 
@@ -176,7 +168,6 @@ def validate_token(token: bytes, session: SessionRecord, now: Optional[float] = 
         if hmac.compare_digest(token, expected):
             return True
     return False
-
 
 def matches_mac(session: SessionRecord, device_mac: Optional[str]) -> bool:
     if session.phone_mac is None:

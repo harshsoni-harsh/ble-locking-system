@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 from typing import Dict, Optional
 
 import paho.mqtt.client as mqtt
@@ -23,6 +24,9 @@ MQTT_PORT = 1883
 LOCK_ID = "lock_01"
 DEFAULT_RSSI_THRESHOLD = -70
 
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
 AUTHORIZED_PHONES: Dict[str, Dict[str, int]] = {
     # "AA:BB:CC:DD:EE:FF": {"rssi_threshold": -68},
 }
@@ -31,36 +35,39 @@ BACKEND_PUBLIC_KEY, LOCK_PRIVATE_KEY = load_keys(LOCK_ID)
 
 SESSIONS: Dict[str, SessionRecord] = {}
 
-
 def on_message(client, userdata, msg):
-    print(f"Received request on {msg.topic}")
+    logger.info("Received request on %s", msg.topic)
     try:
         payload = json.loads(msg.payload.decode())
     except json.JSONDecodeError:
-        print("Malformed JSON payload; ignoring")
+        logger.error("Malformed JSON payload; ignoring")
         return
 
     try:
         session = extract_session(payload, LOCK_ID, BACKEND_PUBLIC_KEY, LOCK_PRIVATE_KEY)
     except SessionError as exc:
-        print(f"Invalid session payload: {exc}")
+        logger.error("Invalid session payload: %s", exc)
         return
 
     phone_mac = session.phone_mac
     if not phone_mac:
-        print("Payload missing phone MAC; ignoring")
+        logger.error("Payload missing phone MAC; ignoring")
         return
 
     if phone_mac not in AUTHORIZED_PHONES:
-        print(f"Unauthorized phone {phone_mac}; ignoring")
+        logger.warning("Unauthorized phone %s; ignoring", phone_mac)
         return
 
     SESSIONS[phone_mac] = session
     key_b64 = base64.b64encode(session.key).decode()
-    print(
-        f"Stored session for {phone_mac}: key={key_b64} expires={session.expiry} nonce={session.nonce} offset={session.offset}"
+    logger.info(
+        "Stored session for %s: key=%s expires=%s nonce=%s offset=%s",
+        phone_mac,
+        key_b64,
+        session.expiry,
+        session.nonce,
+        session.offset,
     )
-
 
 def detection_callback(device, advertisement_data):
     device_mac = normalize_mac(device.address)
@@ -75,7 +82,12 @@ def detection_callback(device, advertisement_data):
     threshold = entry.get("rssi_threshold", DEFAULT_RSSI_THRESHOLD)
     rssi = advertisement_data.rssi
     if rssi is not None and rssi <= threshold:
-        print(f"Device {device_mac} too far (RSSI {rssi} <= {threshold}); ignoring")
+        logger.info(
+            "Device %s too far (RSSI %s <= %s); ignoring",
+            device_mac,
+            rssi,
+            threshold,
+        )
         return
 
     token_sources = advertisement_data.manufacturer_data or {}
@@ -84,15 +96,18 @@ def detection_callback(device, advertisement_data):
         return
 
     if has_expired(session):
-        print(f"Session for {device_mac} expired at {session.expiry}; dropping")
+        logger.warning(
+            "Session for %s expired at %s; dropping",
+            device_mac,
+            session.expiry,
+        )
         SESSIONS.pop(device_mac, None)
         return
 
     if validate_token(token, session):
-        print(f"Token valid for {device_mac}! Unlocking...")
+        logger.info("Token valid for %s; unlocking", device_mac)
     else:
-        print(f"Invalid token from {device_mac}: {token.hex()}")
-
+        logger.warning("Invalid token from %s: %s", device_mac, token.hex())
 
 async def main():
     client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
@@ -101,17 +116,17 @@ async def main():
     topic = f"locks/{LOCK_ID}/session"
     client.subscribe(topic)
     client.loop_start()
-    print(f"Subscribed to {topic} for session keys")
+    logger.info("Subscribed to %s for session keys", topic)
 
     scanner = BleakScanner(detection_callback=detection_callback)
     await scanner.start()
-    print("BLE scanner started")
+    logger.info("BLE scanner started")
 
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("Stopping...")
+        logger.info("Stopping...")
     finally:
         client.loop_stop()
         client.disconnect()
