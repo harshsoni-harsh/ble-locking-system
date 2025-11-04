@@ -3,7 +3,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, cast
+from typing import Dict, Optional, cast
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
@@ -72,7 +72,12 @@ def sign_payload(payload: bytes) -> str:
 	return base64.b64encode(signature).decode()
 
 
-def issue_session_key(device_id: str, expiry: int = 300):
+def issue_session_key(
+	device_id: str,
+	phone_mac: Optional[str] = None,
+	expiry: int = 300,
+	clock_offset: Optional[int] = None,
+):
 	session_key = generate_session_key()
 	encrypted_key = encrypt_for_lock(session_key, device_id)
 	expiry_ts = int(time.time()) + expiry
@@ -84,6 +89,10 @@ def issue_session_key(device_id: str, expiry: int = 300):
 		"expiry": expiry_ts,
 		"nonce": nonce,
 	}
+	if phone_mac:
+		payload_dict["phone_mac"] = phone_mac
+	if clock_offset is not None:
+		payload_dict["clock_offset"] = clock_offset
 	payload_json = json.dumps(payload_dict, separators=(",", ":"))
 	payload_dict["signature"] = sign_payload(payload_json.encode())
 	final_payload = json.dumps(payload_dict, separators=(",", ":"))
@@ -101,6 +110,10 @@ def issue_session_key(device_id: str, expiry: int = 300):
 			"expiry": expiry_ts,
 			"nonce": nonce,
 		}
+		if phone_mac:
+			guest_payload["phone_mac"] = phone_mac
+		if clock_offset is not None:
+			guest_payload["clock_offset"] = clock_offset
 		guest_topic = f"guests/{device_id}/session"
 		client.publish(guest_topic, json.dumps(guest_payload), qos=1).wait_for_publish()
 		print(f"Published plain session key for {device_id} to {guest_topic}")
@@ -119,9 +132,19 @@ def on_message(client, userdata, msg):
 		return
 
 	device_id = payload.get("lock_id")
-	print(payload.get("curr_time")) # time difference between user and backend utc time
+	client_time = payload.get("curr_time")
+	server_time = int(time.time())
+	clock_offset = 0
+	if isinstance(client_time, (int, float)):
+		clock_offset = int(client_time) - server_time
+		print(f"Clock offset for request: client={int(client_time)} server={server_time} offset={clock_offset}")
 	if device_id and device_id in LOCK_PUBLIC_KEYS:
-		issue_session_key(device_id)
+		phone_mac = payload.get("phone_mac")
+		issue_session_key(
+			device_id,
+			phone_mac=phone_mac,
+			clock_offset=clock_offset,
+		)
 	else:
 		print("Invalid request")
 
@@ -133,10 +156,14 @@ def main():
 		client.connect(MQTT_BROKER, MQTT_PORT, 60)
 		request_topic = "backend/session_requests"
 		client.subscribe(request_topic)
-		print(f"Backend listening for session requests on {request_topic}")
+		print(f"[SYS] Backend listening for session requests on {request_topic}")
 		client.loop_forever()
 	except ConnectionRefusedError:
-		print("Failed to connect to MQTT broker. Make sure the broker is running on 10.0.15.108:1883")
+		print("[MQTT] Failed to connect to MQTT broker. Make sure the broker is running on 10.0.15.108:1883")
+	except KeyboardInterrupt:
+		print("\n[SYS] Script stopped by user.")
+	except Exception as e:
+		print(f"\n[ERR] {e}")
 
 
 if __name__ == "__main__":
