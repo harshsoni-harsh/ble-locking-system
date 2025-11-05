@@ -1,12 +1,10 @@
 import base64
 import binascii
-import hmac
-import hashlib
 import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple, cast
+from typing import Optional, Sequence, Tuple, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
@@ -17,11 +15,10 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_public_key,
 )
 
+from .utils import derive_phone_hash, normalize_mac
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 KEYS_DIR = ROOT_DIR / "keys"
-ADVERT_INTERVAL = 30
-ROLLING_WINDOW = 1
-MANUFACTURER_ID = 0xFFFF
 
 class SessionError(Exception):
     pass
@@ -33,11 +30,7 @@ class SessionRecord:
     offset: int = 0
     phone_mac: Optional[str] = None
     nonce: Optional[str] = None
-
-def normalize_mac(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    return str(value).upper()
+    phone_hash: Optional[bytes] = None
 
 def load_keys(lock_id: str) -> Tuple[rsa.RSAPublicKey, rsa.RSAPrivateKey]:
     with open(KEYS_DIR / "backend_public.pem", "rb") as handle:
@@ -126,6 +119,7 @@ def extract_session(
 
     phone_mac = normalize_mac(payload.get("phone_mac"))
     nonce = payload.get("nonce")
+    phone_hash = derive_phone_hash(phone_mac) if phone_mac else None
 
     return SessionRecord(
         key=session_key,
@@ -133,6 +127,7 @@ def extract_session(
         offset=offset,
         phone_mac=phone_mac,
         nonce=nonce,
+        phone_hash=phone_hash,
     )
 
 def has_expired(session: SessionRecord, now: Optional[float] = None) -> bool:
@@ -140,38 +135,11 @@ def has_expired(session: SessionRecord, now: Optional[float] = None) -> bool:
         now = time.time()
     return now >= session.expiry
 
+__all__ = [
+    "SessionError",
+    "SessionRecord",
+    "load_keys",
+    "extract_session",
+    "has_expired",
+]
 
-def iter_slots(session: SessionRecord, now: Optional[float] = None) -> Iterable[int]:
-    if now is None:
-        now = time.time()
-    effective_time = now + session.offset
-    current_slot = int(effective_time // ADVERT_INTERVAL)
-    for delta in range(ROLLING_WINDOW + 1):
-        slot = current_slot - delta
-        if slot >= 0:
-            yield slot
-
-def expected_token(session: SessionRecord, slot: int) -> bytes:
-    nonce_bytes = (session.nonce or "").encode()
-    message = nonce_bytes + str(slot).encode()
-    return hmac.new(session.key, message, hashlib.sha256).digest()[:16]
-
-
-def validate_token(token: bytes, session: SessionRecord, now: Optional[float] = None) -> bool:
-    if has_expired(session, now):
-        return False
-    for slot in iter_slots(session, now):
-        try:
-            expected = expected_token(session, slot)
-        except SessionError:
-            return False
-        if hmac.compare_digest(token, expected):
-            return True
-    return False
-
-def matches_mac(session: SessionRecord, device_mac: Optional[str]) -> bool:
-    if session.phone_mac is None:
-        return True
-    if device_mac is None:
-        return False
-    return session.phone_mac == normalize_mac(device_mac)

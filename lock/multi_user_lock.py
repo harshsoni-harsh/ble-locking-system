@@ -2,24 +2,26 @@ import asyncio
 import base64
 import json
 import logging
-from typing import Dict, Optional
+import sys
+import time
+from pathlib import Path
+from typing import Dict
 
 import paho.mqtt.client as mqtt
 from bleak import BleakScanner
 from paho.mqtt.enums import CallbackAPIVersion
 
-from lock.core import (
-    MANUFACTURER_ID,
-    SessionError,
-    SessionRecord,
-    extract_session,
-    has_expired,
-    load_keys,
-    normalize_mac,
-    validate_token,
-)
+if __package__ is None or __package__ == "":  # pragma: no cover - script execution support
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    __package__ = "lock"
 
-MQTT_BROKER = "10.0.15.108"
+from .auth_service import register_auth_service, unregister_auth_service
+from .constants import MANUFACTURER_ID
+from .core import SessionError, extract_session, load_keys
+from .hybrid import HybridAuthenticator
+from .utils import normalize_mac
+
+MQTT_BROKER = "0.0.0.0"
 MQTT_PORT = 1883
 LOCK_ID = "lock_01"
 DEFAULT_RSSI_THRESHOLD = -70
@@ -32,10 +34,21 @@ AUTHORIZED_PHONES: Dict[str, Dict[str, int]] = {
 }
 
 BACKEND_PUBLIC_KEY, LOCK_PRIVATE_KEY = load_keys(LOCK_ID)
+AUTHENTICATOR = HybridAuthenticator(LOCK_ID)
 
-SESSIONS: Dict[str, SessionRecord] = {}
 
-def on_message(client, userdata, msg):
+def _authorized(mac: str) -> bool:
+    return mac in AUTHORIZED_PHONES
+
+
+def _unlock_callback(mac: str, _session) -> None:
+    logger.info("Unlock granted to %s", mac)
+
+
+AUTHENTICATOR.on_unlock = _unlock_callback
+
+
+def on_message(client, _userdata, msg):
     logger.info("Received request on %s", msg.topic)
     try:
         payload = json.loads(msg.payload.decode())
@@ -49,81 +62,108 @@ def on_message(client, userdata, msg):
         logger.error("Invalid session payload: %s", exc)
         return
 
-    phone_mac = session.phone_mac
-    if not phone_mac:
-        logger.error("Payload missing phone MAC; ignoring")
+    mac = normalize_mac(session.phone_mac)
+    if not mac or not _authorized(mac):
+        logger.warning("Unauthorized phone %s; ignoring", session.phone_mac)
         return
 
-    if phone_mac not in AUTHORIZED_PHONES:
-        logger.warning("Unauthorized phone %s; ignoring", phone_mac)
+    try:
+        AUTHENTICATOR.register_session(session)
+    except ValueError as exc:
+        logger.error("Failed to register session: %s", exc)
         return
 
-    SESSIONS[phone_mac] = session
     key_b64 = base64.b64encode(session.key).decode()
     logger.info(
-        "Stored session for %s: key=%s expires=%s nonce=%s offset=%s",
-        phone_mac,
+        "Stored session for %s key=%s expires=%s",
+        mac,
         key_b64,
         session.expiry,
-        session.nonce,
-        session.offset,
     )
 
+
 def detection_callback(device, advertisement_data):
-    device_mac = normalize_mac(device.address)
-    if not device_mac:
+    mac = normalize_mac(device.address)
+    if not mac or not _authorized(mac):
         return
 
-    session = SESSIONS.get(device_mac)
-    if session is None:
-        return
-
-    entry = AUTHORIZED_PHONES.get(device_mac, {})
+    entry = AUTHORIZED_PHONES.get(mac, {})
     threshold = entry.get("rssi_threshold", DEFAULT_RSSI_THRESHOLD)
     rssi = advertisement_data.rssi
     if rssi is not None and rssi <= threshold:
-        logger.info(
-            "Device %s too far (RSSI %s <= %s); ignoring",
-            device_mac,
+        logger.debug(
+            "Device %s too far (RSSI %s <= %s)",
+            mac,
             rssi,
             threshold,
         )
         return
 
-    token_sources = advertisement_data.manufacturer_data or {}
-    token = token_sources.get(MANUFACTURER_ID)
-    if not token:
+    payload_map = advertisement_data.manufacturer_data or {}
+    payload = payload_map.get(MANUFACTURER_ID)
+    if not payload:
         return
 
-    if has_expired(session):
-        logger.warning(
-            "Session for %s expired at %s; dropping",
-            device_mac,
-            session.expiry,
+    verification = AUTHENTICATOR.handle_advertisement(
+        mac,
+        bytes(payload),
+        rssi,
+        now=time.time(),
+    )
+    if verification:
+        logger.info(
+            "Advertisement accepted from %s (step=0x%02X)",
+            mac,
+            verification.frame.time_step,
         )
-        SESSIONS.pop(device_mac, None)
-        return
 
-    if validate_token(token, session):
-        logger.info("Token valid for %s; unlocking", device_mac)
-    else:
-        logger.warning("Invalid token from %s: %s", device_mac, token.hex())
 
-async def main():
+async def setup_mqtt() -> mqtt.Client:
     client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
     client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    except OSError as exc:
+        raise ConnectionError(
+            f"Failed to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}: {exc}"
+        ) from exc
     topic = f"locks/{LOCK_ID}/session"
     client.subscribe(topic)
     client.loop_start()
     logger.info("Subscribed to %s for session keys", topic)
+    return client
+
+
+async def main():
+    try:
+        client = await setup_mqtt()
+    except ConnectionError as exc:
+        logger.error("Unable to connect to MQTT broker: %s", exc)
+        return
+
+    try:
+        service, bus, adapter = await register_auth_service(AUTHENTICATOR)
+    except RuntimeError as exc:
+        logger.error("Unable to register BLE GATT service: %s", exc)
+        client.loop_stop()
+        client.disconnect()
+        return
 
     scanner = BleakScanner(detection_callback=detection_callback)
-    await scanner.start()
+    try:
+        await scanner.start()
+    except Exception as exc:
+        logger.error("Failed to start BLE scanner: %s", exc)
+        await unregister_auth_service(service, bus, adapter)
+        client.loop_stop()
+        client.disconnect()
+        return
+
     logger.info("BLE scanner started")
 
     try:
         while True:
+            AUTHENTICATOR.purge()
             await asyncio.sleep(1)
     except KeyboardInterrupt:
         logger.info("Stopping...")
@@ -131,6 +171,7 @@ async def main():
         client.loop_stop()
         client.disconnect()
         await scanner.stop()
+        await unregister_auth_service(service, bus, adapter)
 
 
 if __name__ == "__main__":

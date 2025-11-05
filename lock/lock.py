@@ -2,25 +2,19 @@ import asyncio
 import base64
 import json
 import logging
-from typing import Optional
+import time
 
 import paho.mqtt.client as mqtt
-from paho.mqtt.enums import CallbackAPIVersion
 from bleak import BleakScanner
+from paho.mqtt.enums import CallbackAPIVersion
 
-from lock.core import (
-	MANUFACTURER_ID,
-	SessionError,
-	SessionRecord,
-	extract_session,
-	has_expired,
-	load_keys,
-	matches_mac,
-	normalize_mac,
-	validate_token,
-)
+from .auth_service import register_auth_service, unregister_auth_service
+from .constants import MANUFACTURER_ID
+from .core import SessionError, extract_session, load_keys
+from .hybrid import HybridAuthenticator
+from .utils import normalize_mac
 
-MQTT_BROKER = "10.0.15.108"
+MQTT_BROKER = "0.0.0.0"
 MQTT_PORT = 1883
 LOCK_ID = "lock_01"
 RSSI_THRESHOLD = -70
@@ -29,13 +23,18 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 BACKEND_PUBLIC_KEY, LOCK_PRIVATE_KEY = load_keys(LOCK_ID)
+AUTHENTICATOR = HybridAuthenticator(LOCK_ID)
 
-SESSION: Optional[SessionRecord] = None
 
-def on_message(client, userdata, msg):
-	global SESSION
+def _log_unlock(mac: str, _session) -> None:
+	logger.info("Unlock granted to %s", mac)
+
+
+AUTHENTICATOR.on_unlock = _log_unlock
+
+
+def on_message(client, _userdata, msg):
 	logger.info("Received MQTT message on %s", msg.topic)
-
 	try:
 		payload = json.loads(msg.payload.decode())
 	except json.JSONDecodeError:
@@ -48,54 +47,50 @@ def on_message(client, userdata, msg):
 		logger.error("Invalid session payload: %s", exc)
 		return
 
-	SESSION = session
+	try:
+		AUTHENTICATOR.register_session(session)
+	except ValueError as exc:
+		logger.error("Session rejected: %s", exc)
+		return
+
 	key_b64 = base64.b64encode(session.key).decode()
 	logger.info(
-		"Decrypted session key: %s (expires %s, nonce %s)",
-		key_b64,
+		"Stored session for %s exp=%s nonce=%s key=%s",
+		session.phone_mac,
 		session.expiry,
 		session.nonce,
+		key_b64,
 	)
-	if session.offset:
-		logger.info(
-			"Applied clock offset %s seconds for session; phone=%s",
-			session.offset,
-			session.phone_mac,
-		)
-	else:
-		logger.info("Session registered for phone=%s", session.phone_mac)
+
 
 def detection_callback(device, advertisement_data):
-	session = SESSION
-	if session is None:
+	payload_map = advertisement_data.manufacturer_data or {}
+	payload = payload_map.get(MANUFACTURER_ID)
+	if not payload:
 		return
 
-	token_map = advertisement_data.manufacturer_data or {}
-	if MANUFACTURER_ID not in token_map:
-		return
-
-	token = token_map[MANUFACTURER_ID]
 	rssi = advertisement_data.rssi
-	logger.debug("RSSI %s, threshold %s", rssi, RSSI_THRESHOLD)
 	if rssi is not None and rssi <= RSSI_THRESHOLD:
-		logger.info("Device %s below RSSI threshold; ignoring", device.address)
+		logger.debug("Device %s below RSSI threshold (%s <= %s)", device.address, rssi, RSSI_THRESHOLD)
 		return
 
-	device_mac = normalize_mac(device.address)
-	if not matches_mac(session, device_mac):
-		logger.info("Ignoring advertisement from unexpected device %s", device_mac)
-		return
+	verification = AUTHENTICATOR.handle_advertisement(
+		device.address,
+		bytes(payload),
+		rssi,
+		now=time.time(),
+	)
+	if verification:
+		mac = normalize_mac(device.address)
+		logger.info(
+			"Accepted advertisement from %s (step=0x%02X, rssi=%s)",
+			mac,
+			verification.frame.time_step,
+			rssi,
+		)
 
-	if has_expired(session):
-		logger.warning("Session key expired at %s; rejecting token", session.expiry)
-		return
 
-	if validate_token(token, session):
-		logger.info("Token valid for %s; unlocking", device_mac)
-	else:
-		logger.warning("Invalid token from %s: %s", device_mac, token.hex())
-
-async def main():
+async def setup_mqtt() -> mqtt.Client:
 	client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
 	client.on_message = on_message
 	client.connect(MQTT_BROKER, MQTT_PORT, 60)
@@ -103,13 +98,35 @@ async def main():
 	client.subscribe(topic)
 	client.loop_start()
 	logger.info("Subscribed to %s for session keys", topic)
+	return client
+
+
+async def main():
+	client = await setup_mqtt()
+
+	try:
+		service, bus, adapter = await register_auth_service(AUTHENTICATOR)
+	except RuntimeError as exc:
+		logger.error("Unable to register BLE GATT service: %s", exc)
+		client.loop_stop()
+		client.disconnect()
+		return
 
 	scanner = BleakScanner(detection_callback=detection_callback)
-	await scanner.start()
-	logger.info("BLE scanner started")
+	try:
+		await scanner.start()
+	except Exception as exc:
+		logger.error("Failed to start BLE scanner: %s", exc)
+		await unregister_auth_service(service, bus, adapter)
+		client.loop_stop()
+		client.disconnect()
+		return
+
+	logger.info("BLE scanner started (watching manufacturer 0x%04X)", MANUFACTURER_ID)
 
 	try:
 		while True:
+			AUTHENTICATOR.purge()
 			await asyncio.sleep(1)
 	except KeyboardInterrupt:
 		logger.info("Stopping...")
@@ -117,6 +134,8 @@ async def main():
 		client.loop_stop()
 		client.disconnect()
 		await scanner.stop()
+		await unregister_auth_service(service, bus, adapter)
+
 
 if __name__ == "__main__":
 	asyncio.run(main())

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.serialization import (
 ROOT_DIR = Path(__file__).resolve().parent.parent
 KEYS_DIR = ROOT_DIR / "keys"
 
-MQTT_BROKER = "10.0.15.108"
+MQTT_BROKER = "0.0.0.0"
 MQTT_PORT = 1883
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")

@@ -1,7 +1,7 @@
 # BLE Locking System - Architecture and Flow Documentation
 
 ## Overview
-This project implements a secure BLE-based locking system using MQTT for session key delivery and RSA encryption for key security. The system consists of three main components: Backend (session key issuer), Lock (BLE scanner), and Guest (advertiser app). Communication is limited to BLE advertisements and MQTT protocols.
+This project implements a secure BLE-based locking system using MQTT for session key delivery, RSA encryption for key security, and a **hybrid BLE authentication protocol** that combines connectionless TOTP beacons with a GATT challenge–response exchange. The system consists of three main components: Backend (session key issuer), Lock (scanner + GATT peripheral), and Guest (advertiser + central). Communication flows over BLE and MQTT.
 
 ## Architecture Components
 
@@ -16,34 +16,36 @@ This project implements a secure BLE-based locking system using MQTT for session
   - Publishes plain key to `guests/{lock_id}/session`
 
 ### 2. Lock (lock.py)
-- **Role**: BLE scanner that detects and validates guest advertisements
+- **Role**: BLE scanner and GATT peripheral executing hybrid authentication
 - **Responsibilities**:
-  - Subscribes to MQTT topic `locks/{lock_id}/session` for encrypted session keys
-  - Decrypts session keys using lock's RSA private key
-  - Scans for BLE advertisements from guests
-  - Validates HMAC token in advertisement local name
-  - Triggers unlock if token is valid
-  - Validates session key expiry
+   - Subscribes to MQTT topic `locks/{lock_id}/session` for encrypted session keys
+   - Decrypts session keys using the lock's RSA private key
+   - Scans for connectionless BLE advertisements from phones
+   - Verifies the TOTP-based manufacturer payload, RSSI, and replay cache
+   - Exposes a custom GATT service that issues per-connection challenges
+   - Validates the phone's HMAC response within strict timing windows
+   - Triggers unlock only after successful challenge–response verification
 
-### 3. Guest (ble_unlock_app.py)
-- **Role**: App that requests session key and advertises unlock token
+### 3. Guest (guest/unlocker.py)
+- **Role**: App that requests session key, advertises TOTP frames, and completes the challenge–response
 - **Responsibilities**:
-  - Publishes request to `backend/session_requests` with lock_id
-  - Subscribes to `guests/{lock_id}/session` for session key
-  - Generates HMAC token using session key
-  - Advertises with token in manufacturer data (company ID 0xFFFF)
-  - Validates session key expiry
+   - Publishes request to `backend/session_requests` with lock_id and phone identifier
+   - Subscribes to `guests/{lock_id}/session` for the symmetric session key
+   - Continuously emits manufacturer data beacons containing protocol metadata, TOTP, and CMAC
+   - Connects to the lock, reads the challenge, verifies the lock MAC, and writes the HMAC response
+   - Observes token lifetime and latency constraints to mitigate relay attempts
+   - Configure `LOCK_ADDRESS` in `guest/unlocker.py` to match the target lock's BLE MAC before attempting unlocks
 
 ### 4. MQTT Broker
 - **Role**: Message broker for secure key delivery
 - **Configuration**: Mosquitto with anonymous access enabled
 
 ## Security Features
-- **RSA Encryption**: Session keys encrypted for lock using RSA-OAEP
-- **Digital Signatures**: Payloads signed with PSS padding
-- **HMAC Tokens**: Advertisement tokens use HMAC-SHA256
-- **Session Key Expiry**: Keys valid for 5 minutes
-- **Nonce**: Prevents replay attacks
+- **RSA + Signatures**: Session keys encrypted with RSA-OAEP and signed with PSS
+- **Hybrid BLE auth**: TOTP advertisements bound to a follow-up challenge–response exchange
+- **AES-CMAC + HMAC**: Manufacturer payload and responses protected with independent MAC keys
+- **Replay protection**: Time-step windows, nonce-based challenges, and per-session replay cache
+- **Timing & proximity**: RSSI thresholds, connection latency deadlines, and token lifetimes limit relay attacks
 
 ### Detailed Flow Steps:
 1. **Session Key Request**:
@@ -60,13 +62,13 @@ This project implements a secure BLE-based locking system using MQTT for session
    - Lock receives encrypted key, decrypts with private key
    - Guest receives plain key
 
-4. **BLE Unlock**:
-   - Guest generates HMAC-SHA256(session_key, "unlock")[:16]
-   - Guest advertises with manufacturer data containing the token (company ID 0xFFFF)
-   - Lock scans for advertisements
-   - Lock extracts token from manufacturer data
-   - Lock verifies token matches expected HMAC
-   - If valid, unlock successful
+4. **Hybrid BLE Unlock**:
+   - Guest advertises manufacturer data `[proto|lock_short|phone_hash|step|totp|cmac]`
+   - Lock scans, validates CMAC + TOTP within ±1 step and RSSI threshold, caches pending auth
+   - Phone connects to lock, reads challenge `{nonce|lock_ts|session_id|cmac}`
+   - Phone verifies lock authenticity, computes `HMAC(shared_key, context || nonce || lock_ts || session_id || phone_ts || step)`
+   - Phone writes `{phone_ts|step|resp_mac}`
+   - Lock recomputes HMAC, enforces timing budgets, and unlocks on success
 
 ## Setup Instructions
 
@@ -143,8 +145,8 @@ RSA keys are pre-generated in the code. For production:
 
 ### Expected Output
 - Backend: "Backend listening for session requests on backend/session_requests"
-- Lock: "Subscribed to locks/lock_01/session for session keys" + BLE scan messages
-- Guest: "Requested session key", "Received session key", then "Advertising with token"
+- Lock: subscription message, advertisement acceptance logs, challenge/response success
+- Guest: session key acquisition, advertising updates, handshake success logs
 
 ## Troubleshooting
 
@@ -160,10 +162,11 @@ RSA keys are pre-generated in the code. For production:
 - For advertising (guest): Ensure bluez-peripheral can access BLE
 - For scanning (lock): Ensure bleak can access BLE
 
-### Key Errors
+### Key / Authentication Errors
 - Verify RSA keys are correct format
-- Check expiry times
-- Ensure cryptography library installed
+- Check session expiry and local clock skew
+- Ensure the lock and phone share the same manufacturer ID constant
+- Confirm the phone connects within the allowed time window and RSSI threshold
 
 ## Security Considerations
 - Use strong RSA keys (2048+ bits)
@@ -173,8 +176,8 @@ RSA keys are pre-generated in the code. For production:
 - Use TLS for MQTT in production
 
 ## Future Enhancements
-- Add user authentication
-- Implement lock status publishing
-- Add multiple lock support
-- Integrate with mobile apps
-- Add audit logging
+- Add user authentication and provisioning UX
+- Publish lock status and audit events over MQTT
+- Expand to multiple locks with key derivation per device
+- Integrate with native mobile stacks (Android/iOS)
+- Support secure key rotation and revocation workflows
