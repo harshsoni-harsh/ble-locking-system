@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.serialization import (
 ROOT_DIR = Path(__file__).resolve().parent.parent
 KEYS_DIR = ROOT_DIR / "keys"
 
-MQTT_BROKER = "10.0.15.108"
+MQTT_BROKER = "10.0.10.142"
 MQTT_PORT = 1883
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -73,7 +73,6 @@ def sign_payload(payload: bytes) -> str:
 
 def issue_session_key(
 	device_id: str,
-	phone_mac: Optional[str] = None,
 	expiry: int = 300,
 	clock_offset: Optional[int] = None,
 ):
@@ -88,8 +87,6 @@ def issue_session_key(
 		"expiry": expiry_ts,
 		"nonce": nonce,
 	}
-	if phone_mac:
-		payload_dict["phone_mac"] = phone_mac
 	if clock_offset is not None:
 		payload_dict["clock_offset"] = clock_offset
 	payload_json = json.dumps(payload_dict, separators=(",", ":"))
@@ -140,10 +137,8 @@ def on_message(client, userdata, msg):
 			clock_offset,
 		)
 	if device_id and device_id in LOCK_PUBLIC_KEYS:
-		phone_mac = payload.get("phone_mac")
 		issue_session_key(
 			device_id,
-			phone_mac=phone_mac,
 			clock_offset=clock_offset,
 		)
 	else:

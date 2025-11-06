@@ -73,7 +73,7 @@ def extract_session(
 
     canonical = _canonical_payload(
         payload,
-        ("device_id", "session_key", "expiry", "nonce", "clock_offset", "phone_mac"),
+        ("device_id", "session_key", "expiry", "nonce", "phone_mac", "clock_offset"),
     )
 
     try:
@@ -124,8 +124,8 @@ def extract_session(
     except (TypeError, ValueError):
         offset = 0
 
-    phone_mac = normalize_mac(payload.get("phone_mac"))
     nonce = payload.get("nonce")
+    phone_mac = normalize_mac(payload.get("phone_mac"))
 
     return SessionRecord(
         key=session_key,

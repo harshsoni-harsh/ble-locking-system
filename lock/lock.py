@@ -20,7 +20,7 @@ from lock.core import (
 	validate_token,
 )
 
-MQTT_BROKER = "10.0.15.108"
+MQTT_BROKER = "10.0.10.142"
 MQTT_PORT = 1883
 LOCK_ID = "lock_01"
 RSSI_THRESHOLD = -70
@@ -56,15 +56,7 @@ def on_message(client, userdata, msg):
 		session.expiry,
 		session.nonce,
 	)
-	if session.offset:
-		logger.info(
-			"Applied clock offset %s seconds for session; phone=%s",
-			session.offset,
-			session.phone_mac,
-		)
-	else:
-		logger.info("Session registered for phone=%s", session.phone_mac)
-
+	
 def detection_callback(device, advertisement_data):
 	session = SESSION
 	if session is None:
