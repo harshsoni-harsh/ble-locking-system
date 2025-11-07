@@ -4,11 +4,15 @@ import json
 import logging
 import hmac
 import hashlib
+import os
 import time
 from typing import Any, Dict, Optional
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
+from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 from bluez_peripheral.advert import Advertisement
 from bluez_peripheral.util import get_message_bus, Adapter
 from dbus_next.constants import MessageType, PropertyAccess
@@ -28,6 +32,11 @@ MQTT_PORT = 1883
 MANUFACTURER_ID = 0xFFFF
 ADVERT_INTERVAL = 30
 ADVERT_TIMEOUT = 0  # Continuous advertising
+ISSUER_BEACON_NAME = os.getenv("ISSUER_BEACON_NAME", "IssuerBeacon")
+ISSUER_BEACON_ADDRESS = os.getenv("ISSUER_BEACON_ADDRESS")
+ISSUER_SCAN_TIMEOUT = 8.0
+ISSUER_CONNECT_TIMEOUT = 10.0
+ISSUER_CONNECTION_HOLD_TIME = 2.0
 
 session_key_data = None
 
@@ -38,7 +47,7 @@ def on_message(client, userdata, msg):
 	data = json.loads(msg.payload.decode())
 	session_key_data = data
 
-def get_session_key(lock_id: str, phone_mac: str):
+def get_session_key(lock_id: str):
 	"""Requests a session key from the backend via MQTT."""
 	global session_key_data
 	session_key_data = None
@@ -52,7 +61,7 @@ def get_session_key(lock_id: str, phone_mac: str):
 
 	guest_topic = f"guests/{lock_id}/session"
 	request_topic = "backend/session_requests"
-	request_payload = json.dumps({"lock_id": lock_id, "phone_mac": phone_mac})
+	request_payload = json.dumps({"lock_id": lock_id})
 
 	client.loop_start()
 	try:
@@ -113,24 +122,60 @@ async def get_first_adapter(bus) -> Adapter:
 
 	raise ValueError("No bluetooth adapters could be found.")
 
-async def _detect_phone_mac() -> str:
-	bus = await get_message_bus()
+async def find_issuer_beacon(scan_timeout: float = ISSUER_SCAN_TIMEOUT) -> BLEDevice:
+	"""Scan for the issuer beacon using optional name/address hints."""
 	try:
-		adapter = await get_first_adapter(bus)
-		address = await adapter.get_address()
-		return address.upper()
-	finally:
-		try:
-			bus.disconnect()
-		except Exception:
-			pass
+		logger.info("Scanning for issuer beacon (timeout %.1fs)", scan_timeout)
+		devices = await BleakScanner.discover(timeout=scan_timeout)
+	except BleakError as exc:
+		raise RuntimeError("BLE scan failed for issuer beacon") from exc
 
-def resolve_phone_mac() -> str:
-	if PHONE_MAC_OVERRIDE:
-		return PHONE_MAC_OVERRIDE.upper()
-	mac = asyncio.run(_detect_phone_mac())
-	logger.info("Detected adapter MAC: %s", mac)
-	return mac
+	selected: Optional[BLEDevice] = None
+	if ISSUER_BEACON_ADDRESS:
+		address = ISSUER_BEACON_ADDRESS.lower().replace("-", ":")
+		for device in devices:
+			print(f"{device.address.lower()} -- {device.name}")
+			if device.address.lower() == address:
+				selected = device
+				break
+	if selected is None and ISSUER_BEACON_NAME:
+		for device in devices:
+			if device.name == ISSUER_BEACON_NAME:
+				selected = device
+				break
+	if selected is None:
+		for device in devices:
+			metadata = getattr(device, "metadata", {}) or {}
+			manufacturer_data = metadata.get("manufacturer_data") if isinstance(metadata, dict) else None
+			if manufacturer_data and MANUFACTURER_ID in manufacturer_data:
+				selected = device
+				break
+
+	if selected is None:
+		raise RuntimeError("Issuer beacon not found during scan")
+	logger.info("Issuer beacon candidate: %s (%s)", selected.name or "unknown", selected.address)
+	return selected
+
+async def connect_issuer_beacon(device: BLEDevice) -> None:
+	"""Connect to the issuer beacon over BLE to confirm proximity."""
+	try:
+		async with BleakClient(device, timeout=ISSUER_CONNECT_TIMEOUT) as client:
+			if not client.is_connected:
+				raise RuntimeError("Failed to establish BLE connection to issuer beacon")
+			logger.info(
+				"Connected to issuer beacon %s (%s)",
+				device.name or "unknown",
+				device.address,
+			)
+			if ISSUER_CONNECTION_HOLD_TIME > 0:
+				await asyncio.sleep(ISSUER_CONNECTION_HOLD_TIME)
+	except BleakError as exc:
+		raise RuntimeError("BLE connection to issuer beacon failed") from exc
+
+async def ensure_issuer_beacon_connection() -> None:
+	"""Ensure the issuer beacon is nearby by scanning and connecting."""
+	device = await find_issuer_beacon()
+	await connect_issuer_beacon(device)
 
 class LockAdvertisement(Advertisement):
 	def __init__(self, session_key: bytes, nonce: Optional[str]):
@@ -207,10 +252,10 @@ async def advertise_loop(session_key: bytes, expiry: int | float, nonce: Optiona
 
 if __name__ == "__main__":
 	try:
-		phone_mac = resolve_phone_mac()
-		logger.info("Using phone MAC %s", phone_mac)
+		logger.info("Ensuring issuer beacon proximity before unlock flow")
+		asyncio.run(ensure_issuer_beacon_connection())
 		logger.info("Requesting session key from backend...")
-		session_key, expiry, nonce = get_session_key(LOCK_ID, phone_mac)
+		session_key, expiry, nonce = get_session_key(LOCK_ID)
 		logger.info("Session key (base64): %s", base64.b64encode(session_key).decode())
 		asyncio.run(advertise_loop(session_key, expiry or 0, nonce))
 	except KeyboardInterrupt:
