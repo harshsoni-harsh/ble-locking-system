@@ -5,13 +5,20 @@ import logging
 import os
 import threading
 import time
-from pathlib import Path
 from contextlib import suppress
-from typing import Dict, Optional, cast
+from pathlib import Path
+from typing import Any, Dict, Optional, cast
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 from bluez_peripheral.advert import Advertisement
+from bluez_peripheral.gatt.characteristic import (
+	CharacteristicFlags,
+	CharacteristicReadOptions,
+	CharacteristicWriteOptions,
+	characteristic,
+)
+from bluez_peripheral.gatt.service import Service, ServiceCollection
 from bluez_peripheral.util import Adapter, get_message_bus
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -31,6 +38,15 @@ KEYS_DIR = ROOT_DIR / "keys"
 
 MQTT_BROKER = "10.0.10.142"
 MQTT_PORT = 1883
+SESSION_EXPIRY_SECONDS = int(os.getenv("SESSION_EXPIRY_SECONDS", "300"))
+PROVISIONING_SERVICE_UUID = os.getenv(
+	"PROVISIONING_SERVICE_UUID",
+	"c0de0001-0000-1000-8000-00805f9b34fb",
+)
+PROVISIONING_CHARACTERISTIC_UUID = os.getenv(
+	"PROVISIONING_CHARACTERISTIC_UUID",
+	"c0de0002-0000-1000-8000-00805f9b34fb",
+)
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,12 +63,19 @@ LOCK_PUBLIC_KEYS: Dict[str, Path] = {
 }
 
 ISSUER_BEACON_NAME = os.getenv("ISSUER_BEACON_NAME", "IssuerBeacon")
-ISSUER_SERVICE_UUIDS = os.getenv("ISSUER_SERVICE_UUIDS", "180D").split(",")
+_SERVICE_UUIDS_ENV = os.getenv("ISSUER_SERVICE_UUIDS", "180D")
+ISSUER_SERVICE_UUIDS = [uuid.strip() for uuid in _SERVICE_UUIDS_ENV.split(",") if uuid.strip()]
+if PROVISIONING_SERVICE_UUID not in ISSUER_SERVICE_UUIDS:
+	ISSUER_SERVICE_UUIDS.append(PROVISIONING_SERVICE_UUID)
 ISSUER_MANUFACTURER_ID = int(os.getenv("ISSUER_MANUFACTURER_ID", str(0xFFFF)))
 ISSUER_MANUFACTURER_PAYLOAD = os.getenv("ISSUER_MANUFACTURER_PAYLOAD", "issuer").encode()
 ISSUER_ADVERT_PATH = "/com/ble_lock/issuer/advert0"
 ISSUER_ADVERT_TIMEOUT = 0
 
+def normalize_mac(value: Optional[str]) -> Optional[str]:
+	if not value:
+		return None
+	return value.replace("-", ":").upper()
 
 async def get_first_adapter(bus) -> Adapter:
 	message = Message(
@@ -108,59 +131,6 @@ class IssuerBeaconAdvertisement(Advertisement):
 	def TxPower(self, value: "n") -> None:  # type: ignore[override]
 		return
 
-
-class IssuerBeaconAdvertiser(threading.Thread):
-	def __init__(self):
-		super().__init__(name="IssuerBeaconAdvertiser", daemon=True)
-		self._stop_event = threading.Event()
-		self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-	def run(self):
-		asyncio.run(self._run())
-
-	async def _run(self):
-		try:
-			bus = await get_message_bus()
-			adapter = await get_first_adapter(bus)
-		except Exception as exc:  # pragma: no cover - hardware dependent
-			logger.error("Issuer beacon setup failed: %s", exc)
-			return
-
-		self._loop = asyncio.get_running_loop()
-		advert = IssuerBeaconAdvertisement()
-		try:
-			await advert.start(bus, adapter)
-			try:
-				adapter_name = await adapter.get_name()
-			except Exception:
-				adapter_name = "unknown"
-			logger.info(
-				"Issuer beacon advertising started on adapter %s", adapter_name
-			)
-			run_log_once = True
-			while not self._stop_event.is_set():
-				if run_log_once:
-					logger.debug("Issuer beacon advertising loop active")
-					run_log_once = False
-				await asyncio.sleep(1)
-		except Exception as exc:  # pragma: no cover - hardware dependent
-			logger.error("Issuer beacon advertising error: %s", exc)
-		finally:
-			with suppress(Exception):
-				await advert.stop(adapter)
-			logger.info("Issuer beacon advertising stopped")
-
-	def stop(self, timeout: float = 5.0):
-		self._stop_event.set()
-		loop = self._loop
-		if loop is not None:
-			try:
-				loop.call_soon_threadsafe(lambda: None)
-			except RuntimeError:
-				pass
-		if self.is_alive():
-			self.join(timeout=timeout)
-
 def generate_session_key() -> bytes:
 	return os.urandom(32)
 
@@ -196,96 +166,204 @@ def sign_payload(payload: bytes) -> str:
 	)
 	return base64.b64encode(signature).decode()
 
-def issue_session_key(
-	device_id: str,
-	expiry: int = 300,
-	clock_offset: Optional[int] = None,
-):
-	session_key = generate_session_key()
-	encrypted_key = encrypt_for_lock(session_key, device_id)
-	expiry_ts = int(time.time()) + expiry
-	nonce = base64.urlsafe_b64encode(os.urandom(8)).decode()
+class SessionIssuer:
+	def __init__(self, broker: str, port: int, expiry_seconds: int = SESSION_EXPIRY_SECONDS):
+		self._broker = broker
+		self._port = port
+		self._expiry_seconds = expiry_seconds
 
-	payload_dict = {
-		"device_id": device_id,
-		"session_key": base64.b64encode(encrypted_key).decode(),
-		"expiry": expiry_ts,
-		"nonce": nonce,
-	}
-	if clock_offset is not None:
-		payload_dict["clock_offset"] = clock_offset
-	payload_json = json.dumps(payload_dict, separators=(",", ":"))
-	payload_dict["signature"] = sign_payload(payload_json.encode())
-	final_payload = json.dumps(payload_dict, separators=(",", ":"))
+	def issue_session(
+		self,
+		lock_id: str,
+		*,
+		phone_mac: Optional[str] = None,
+		client_time: Optional[float] = None,
+	) -> Dict[str, Any]:
+		if lock_id not in LOCK_PUBLIC_KEYS:
+			raise ValueError(f"Unknown lock id {lock_id}")
 
-	client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
-	client.connect(MQTT_BROKER, MQTT_PORT, 60)
-	client.loop_start()
-	try:
-		topic = f"locks/{device_id}/session"
-		client.publish(topic, final_payload, qos=1).wait_for_publish()
-		logger.info("Published encrypted session key for %s to %s", device_id, topic)
+		session_key = generate_session_key()
+		encrypted_key = encrypt_for_lock(session_key, lock_id)
+		server_time = int(time.time())
+		expiry_ts = server_time + self._expiry_seconds
+		nonce = base64.urlsafe_b64encode(os.urandom(8)).decode()
+		normalized_mac = normalize_mac(phone_mac)
+		clock_offset = 0
+		if isinstance(client_time, (int, float)):
+			clock_offset = int(client_time) - server_time
 
-		guest_payload = {
+		payload_dict: Dict[str, Any] = {
+			"device_id": lock_id,
+			"session_key": base64.b64encode(encrypted_key).decode(),
+			"expiry": expiry_ts,
+			"nonce": nonce,
+		}
+		if normalized_mac:
+			payload_dict["phone_mac"] = normalized_mac
+		if isinstance(client_time, (int, float)):
+			payload_dict["clock_offset"] = clock_offset
+
+		payload_json = json.dumps(payload_dict, separators=(",", ":"))
+		payload_dict["signature"] = sign_payload(payload_json.encode())
+		final_payload = json.dumps(payload_dict, separators=(",", ":"))
+
+		topic = f"locks/{lock_id}/session"
+		logger.info("Publishing session payload for %s to %s", lock_id, topic)
+		self._publish(topic, final_payload)
+
+		guest_payload: Dict[str, Any] = {
 			"session_key": base64.b64encode(session_key).decode(),
 			"expiry": expiry_ts,
 			"nonce": nonce,
 		}
-		if clock_offset is not None:
+		if normalized_mac:
+			guest_payload["phone_mac"] = normalized_mac
+		if isinstance(client_time, (int, float)):
 			guest_payload["clock_offset"] = clock_offset
-		guest_topic = f"guests/{device_id}/session"
-		client.publish(guest_topic, json.dumps(guest_payload), qos=1).wait_for_publish()
-		logger.info("Published plain session key for %s to %s", device_id, guest_topic)
-	finally:
-		client.loop_stop()
-		client.disconnect()
-	return session_key, expiry_ts, nonce
 
-def on_message(client, userdata, msg):
-	logger.info("Received request on %s", msg.topic)
-	try:
-		payload = json.loads(msg.payload.decode())
-	except json.JSONDecodeError:
-		logger.error("Invalid request payload")
-		return
-
-	device_id = payload.get("lock_id")
-	client_time = payload.get("curr_time")
-	server_time = int(time.time())
-	clock_offset = 0
-	if isinstance(client_time, (int, float)):
-		clock_offset = int(client_time) - server_time
 		logger.info(
-			"Clock offset for request: client=%s server=%s offset=%s",
-			int(client_time),
-			server_time,
+			"Issued session for %s (expires %s, offset %s)",
+			lock_id,
+			expiry_ts,
 			clock_offset,
 		)
-	if device_id and device_id in LOCK_PUBLIC_KEYS:
-		issue_session_key(
-			device_id,
-			clock_offset=clock_offset,
-		)
-	else:
-		logger.error("Invalid request")
+		return guest_payload
 
+	def _publish(self, topic: str, payload: str) -> None:
+		client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
+		client.connect(self._broker, self._port, 60)
+		client.loop_start()
+		try:
+			client.publish(topic, payload, qos=1).wait_for_publish()
+		finally:
+			client.loop_stop()
+			client.disconnect()
+
+
+class ProvisioningService(Service):
+	exchange_char = characteristic(
+		PROVISIONING_CHARACTERISTIC_UUID,
+		CharacteristicFlags.READ
+		| CharacteristicFlags.WRITE
+		| CharacteristicFlags.NOTIFY,
+	)
+
+	def __init__(self, issuer: SessionIssuer):
+		self._issuer = issuer
+		self._response: bytes = b""
+		super().__init__(PROVISIONING_SERVICE_UUID)
+
+	@exchange_char
+	def _read_exchange(self, options: CharacteristicReadOptions) -> bytes:
+		return self._response
+
+	@exchange_char.setter  # type: ignore[misc]
+	async def _write_exchange(self, data: bytes, options: CharacteristicWriteOptions) -> None:
+		try:
+			payload = json.loads(bytes(data).decode())
+		except (UnicodeDecodeError, json.JSONDecodeError):
+			logger.error("Received malformed provisioning request")
+			response = {"status": "error", "message": "invalid_request"}
+		else:
+			response = await self._handle_request(payload)
+		self._response = json.dumps(response, separators=(",", ":")).encode()
+		self.exchange_char.changed(self._response)
+
+	async def _handle_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+		lock_id = payload.get("lock_id")
+		if not isinstance(lock_id, str) or not lock_id:
+			return {"status": "error", "message": "missing_lock_id"}
+
+		phone_mac = payload.get("phone_mac")
+		client_time = payload.get("client_time")
+
+		try:
+			result = await asyncio.to_thread(
+				self._issuer.issue_session,
+				lock_id,
+				phone_mac=phone_mac,
+				client_time=client_time,
+			)
+		except ValueError as exc:
+			logger.warning("Provisioning request rejected for %s: %s", lock_id, exc)
+			return {"status": "error", "message": str(exc)}
+		except Exception:
+			logger.exception("Provisioning request failed for %s", lock_id)
+			return {"status": "error", "message": "internal_error"}
+
+		return {"status": "ok", **result}
+
+
+class IssuerBeaconAdvertiser(threading.Thread):
+	def __init__(self, issuer: SessionIssuer):
+		super().__init__(name="IssuerBeaconAdvertiser", daemon=True)
+		self._stop_event = threading.Event()
+		self._loop: Optional[asyncio.AbstractEventLoop] = None
+		self._issuer = issuer
+		self._service_collection: Optional[ServiceCollection] = None
+
+	def run(self):
+		asyncio.run(self._run())
+
+	async def _run(self):
+		try:
+			bus = await get_message_bus()
+			adapter = await get_first_adapter(bus)
+		except Exception as exc:  # pragma: no cover - hardware dependent
+			logger.error("Issuer beacon setup failed: %s", exc)
+			return
+
+		self._loop = asyncio.get_running_loop()
+		advert = IssuerBeaconAdvertisement()
+		service = ProvisioningService(self._issuer)
+		collection = ServiceCollection([service])
+		self._service_collection = collection
+		try:
+			await advert.start(bus, adapter)
+			await collection.register(bus, adapter=adapter)
+			try:
+				adapter_name = await adapter.get_name()
+			except Exception:
+				adapter_name = "unknown"
+			logger.info(
+				"Issuer beacon advertising started on adapter %s", adapter_name
+			)
+			logger.info("Provisioning GATT service registered")
+			run_log_once = True
+			while not self._stop_event.is_set():
+				if run_log_once:
+					logger.debug("Issuer beacon advertising loop active")
+					run_log_once = False
+				await asyncio.sleep(1)
+		except Exception as exc:  # pragma: no cover - hardware dependent
+			logger.error("Issuer beacon advertising error: %s", exc)
+		finally:
+			with suppress(Exception):
+				await advert.stop(adapter)
+			with suppress(Exception):
+				if self._service_collection is not None:
+					await self._service_collection.unregister()
+			self._service_collection = None
+			logger.info("Issuer beacon advertising stopped")
+
+	def stop(self, timeout: float = 5.0):
+		self._stop_event.set()
+		loop = self._loop
+		if loop is not None:
+			try:
+				loop.call_soon_threadsafe(lambda: None)
+			except RuntimeError:
+				pass
+		if self.is_alive():
+			self.join(timeout=timeout)
 def main():
-	beacon_thread = IssuerBeaconAdvertiser()
+	session_issuer = SessionIssuer(MQTT_BROKER, MQTT_PORT)
+	beacon_thread = IssuerBeaconAdvertiser(session_issuer)
 	beacon_thread.start()
-	client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
-	client.on_message = on_message
+	logger.info("Issuer beacon ready; press Ctrl+C to stop")
 	try:
-		client.connect(MQTT_BROKER, MQTT_PORT, 60)
-		request_topic = "backend/session_requests"
-		client.subscribe(request_topic)
-		logger.info("Backend listening for session requests on %s", request_topic)
-		client.loop_forever()
-	except ConnectionRefusedError:
-		logger.error(
-			"Failed to connect to MQTT broker. Make sure the broker is running on %s:%s",
-			MQTT_BROKER,
-			MQTT_PORT,
-		)
+		while True:
+			time.sleep(1)
 	except KeyboardInterrupt:
 		logger.info("Script stopped by user.")
 	except Exception as exc:
