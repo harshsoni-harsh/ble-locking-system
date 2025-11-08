@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakError
 from bluez_peripheral.advert import Advertisement
 from bluez_peripheral.util import Adapter, get_message_bus
@@ -75,36 +76,74 @@ async def get_first_adapter(bus) -> Adapter:
 
 	raise ValueError("No bluetooth adapters could be found.")
 
+def _matches_issuer(
+	device: BLEDevice,
+	advertisement: Optional[AdvertisementData] = None,
+) -> bool:
+	if ISSUER_BEACON_ADDRESS:
+		address = ISSUER_BEACON_ADDRESS.lower().replace("-", ":")
+		if device.address.lower() == address:
+			return True
+
+	if ISSUER_BEACON_NAME:
+		adv_name = advertisement.local_name if advertisement else None
+		if device.name == ISSUER_BEACON_NAME or adv_name == ISSUER_BEACON_NAME:
+			return True
+
+	manufacturer_data: Optional[Dict[int, bytes]] = None
+	if advertisement is not None:
+		manufacturer_data = advertisement.manufacturer_data or {}
+	else:
+		metadata = getattr(device, "metadata", {}) or {}
+		if isinstance(metadata, dict):
+			manufacturer_data = metadata.get("manufacturer_data")
+	if manufacturer_data and MANUFACTURER_ID in manufacturer_data:
+		return True
+
+	return False
+
+
 async def find_issuer_beacon(scan_timeout: float = ISSUER_SCAN_TIMEOUT) -> BLEDevice:
 	"""Scan for the issuer beacon using optional name/address hints."""
+	logger.info("Scanning for issuer beacon (timeout %.1fs)", scan_timeout)
+	found_device: Optional[BLEDevice] = None
+	found_event = asyncio.Event()
+
+	def detection_callback(device: BLEDevice, advertisement: AdvertisementData) -> None:
+		nonlocal found_device
+		if found_device is not None:
+			return
+		if _matches_issuer(device, advertisement):
+			found_device = device
+			found_event.set()
+
+	scanner = BleakScanner(detection_callback=detection_callback)
 	try:
-		logger.info("Scanning for issuer beacon (timeout %.1fs)", scan_timeout)
-		devices = await BleakScanner.discover(timeout=scan_timeout)
+		await scanner.start()
 	except BleakError as exc:
 		raise RuntimeError("BLE scan failed for issuer beacon") from exc
 
-	selected: Optional[BLEDevice] = None
-	if ISSUER_BEACON_ADDRESS:
-		address = ISSUER_BEACON_ADDRESS.lower().replace("-", ":")
-		for device in devices:
-			if device.address.lower() == address:
-				selected = device
-				break
-			if device.name is not None and device.name == ISSUER_BEACON_NAME:
-				selected = device
-				break
-	if selected is None:
-		for device in devices:
-			metadata = getattr(device, "metadata", {}) or {}
-			manufacturer_data = metadata.get("manufacturer_data") if isinstance(metadata, dict) else None
-			if manufacturer_data and MANUFACTURER_ID in manufacturer_data:
-				selected = device
+	try:
+		# Check already-known devices immediately.
+		for device in list(scanner.discovered_devices):
+			if _matches_issuer(device):
+				found_device = device
+				found_event.set()
 				break
 
-	if selected is None:
+		if not found_event.is_set():
+			try:
+				await asyncio.wait_for(found_event.wait(), timeout=scan_timeout)
+			except asyncio.TimeoutError:
+				pass
+	finally:
+		with suppress(Exception):
+			await scanner.stop()
+
+	if not found_device:
 		raise RuntimeError("Issuer beacon not found during scan")
-	logger.info("Issuer beacon candidate: %s (%s)", selected.name or "unknown", selected.address)
-	return selected
+	logger.info("Issuer beacon candidate: %s (%s)", found_device.name or "unknown", found_device.address)
+	return found_device
 
 async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optional[str]]:
 	device = await find_issuer_beacon()

@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.serialization import (
 	load_pem_private_key,
 	load_pem_public_key,
 )
+from dbus_next.aio.message_bus import MessageBus
 from dbus_next.constants import MessageType, PropertyAccess
 from dbus_next.errors import DBusError
 from dbus_next.message import Message
@@ -36,7 +37,7 @@ from dbus_next.service import dbus_property
 ROOT_DIR = Path(__file__).resolve().parent.parent
 KEYS_DIR = ROOT_DIR / "keys"
 
-MQTT_BROKER = "10.0.10.142"
+MQTT_BROKER = "127.0.0.1"
 MQTT_PORT = 1883
 SESSION_EXPIRY_SECONDS = int(os.getenv("SESSION_EXPIRY_SECONDS", "300"))
 PROVISIONING_SERVICE_UUID = os.getenv(
@@ -65,8 +66,6 @@ LOCK_PUBLIC_KEYS: Dict[str, Path] = {
 ISSUER_BEACON_NAME = os.getenv("ISSUER_BEACON_NAME", "IssuerBeacon")
 _SERVICE_UUIDS_ENV = os.getenv("ISSUER_SERVICE_UUIDS", "180D")
 ISSUER_SERVICE_UUIDS = [uuid.strip() for uuid in _SERVICE_UUIDS_ENV.split(",") if uuid.strip()]
-if PROVISIONING_SERVICE_UUID not in ISSUER_SERVICE_UUIDS:
-	ISSUER_SERVICE_UUIDS.append(PROVISIONING_SERVICE_UUID)
 ISSUER_MANUFACTURER_ID = int(os.getenv("ISSUER_MANUFACTURER_ID", str(0xFFFF)))
 ISSUER_MANUFACTURER_PAYLOAD = os.getenv("ISSUER_MANUFACTURER_PAYLOAD", "issuer").encode()
 ISSUER_ADVERT_PATH = "/com/ble_lock/issuer/advert0"
@@ -251,30 +250,76 @@ class ProvisioningService(Service):
 	def __init__(self, issuer: SessionIssuer):
 		self._issuer = issuer
 		self._response: bytes = b""
+		self._bus: Optional[MessageBus] = None
 		super().__init__(PROVISIONING_SERVICE_UUID)
+
+	def attach_bus(self, bus: MessageBus) -> None:
+		self._bus = bus
 
 	@exchange_char
 	def _read_exchange(self, options: CharacteristicReadOptions) -> bytes:
 		return self._response
 
-	@exchange_char.setter  # type: ignore[misc]
-	async def _write_exchange(self, data: bytes, options: CharacteristicWriteOptions) -> None:
+	async def _process_exchange_write(
+		self,
+		data: bytes,
+		options: CharacteristicWriteOptions,
+	) -> None:
+		device_path = getattr(options, "device", None)
 		try:
-			payload = json.loads(bytes(data).decode())
+			payload = json.loads(data.decode())
 		except (UnicodeDecodeError, json.JSONDecodeError):
 			logger.error("Received malformed provisioning request")
 			response = {"status": "error", "message": "invalid_request"}
 		else:
-			response = await self._handle_request(payload)
+			response = await self._handle_request(payload, device_path)
 		self._response = json.dumps(response, separators=(",", ":")).encode()
 		self.exchange_char.changed(self._response)
 
-	async def _handle_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+	async def _resolve_device_address(self, device_path: Optional[str]) -> Optional[str]:
+		if not device_path:
+			return None
+		bus = self._bus
+		if bus is None:
+			return None
+		try:
+			introspection = await bus.introspect("org.bluez", device_path)
+			proxy = bus.get_proxy_object("org.bluez", device_path, introspection)
+			props = proxy.get_interface("org.freedesktop.DBus.Properties")
+			props_iface = cast(Any, props)
+			address_variant = await props_iface.call_get("org.bluez.Device1", "Address")
+			if isinstance(address_variant, Variant):
+				return str(address_variant.value)
+			return str(address_variant)
+		except Exception as exc:  # pragma: no cover - best effort lookup
+			logger.warning("Failed to resolve device address for %s: %s", device_path, exc)
+			return None
+
+	def _finalize_exchange_task(self, task: "asyncio.Task[None]") -> None:
+		try:
+			task.result()
+		except Exception as exc:  # pragma: no cover - background task
+			logger.exception("Provisioning write task failed: %s", exc)
+
+	@exchange_char.setter
+	def _write_exchange(self, data: bytes, options: CharacteristicWriteOptions) -> None:
+		task = asyncio.create_task(
+			self._process_exchange_write(bytes(data), options)
+		)
+		task.add_done_callback(self._finalize_exchange_task)
+
+	async def _handle_request(
+		self,
+		payload: Dict[str, Any],
+		device_path: Optional[str],
+	) -> Dict[str, Any]:
 		lock_id = payload.get("lock_id")
 		if not isinstance(lock_id, str) or not lock_id:
 			return {"status": "error", "message": "missing_lock_id"}
 
 		phone_mac = payload.get("phone_mac")
+		if not phone_mac:
+			phone_mac = await self._resolve_device_address(device_path)
 		client_time = payload.get("client_time")
 
 		try:
@@ -316,6 +361,7 @@ class IssuerBeaconAdvertiser(threading.Thread):
 		self._loop = asyncio.get_running_loop()
 		advert = IssuerBeaconAdvertisement()
 		service = ProvisioningService(self._issuer)
+		service.attach_bus(bus)
 		collection = ServiceCollection([service])
 		self._service_collection = collection
 		try:
