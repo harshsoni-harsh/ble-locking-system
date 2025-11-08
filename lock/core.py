@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 KEYS_DIR = ROOT_DIR / "keys"
-ADVERT_INTERVAL = 30
+ADVERT_INTERVAL = 5
 ROLLING_WINDOW = 1
 MANUFACTURER_ID = 0xFFFF
 

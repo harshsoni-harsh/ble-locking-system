@@ -24,11 +24,9 @@ from dbus_next.service import dbus_property
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-PHONE_MAC_OVERRIDE: Optional[str] = os.getenv("PHONE_MAC_OVERRIDE")
-
 LOCK_ID = os.getenv("LOCK_ID", "lock_01")
 MANUFACTURER_ID = 0xFFFF
-ADVERT_INTERVAL = 30
+ADVERT_INTERVAL = 5
 ADVERT_TIMEOUT = 0  # Continuous advertising
 ISSUER_BEACON_NAME = os.getenv("ISSUER_BEACON_NAME", "IssuerBeacon")
 ISSUER_BEACON_ADDRESS = os.getenv("ISSUER_BEACON_ADDRESS")
@@ -176,8 +174,6 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 				"lock_id": lock_id,
 				"client_time": int(time.time()),
 			}
-			if PHONE_MAC_OVERRIDE:
-				request_payload["phone_mac"] = PHONE_MAC_OVERRIDE
 			payload_bytes = json.dumps(request_payload, separators=(",", ":")).encode()
 			await client.write_gatt_char(
 				PROVISIONING_CHARACTERISTIC_UUID,
@@ -223,7 +219,7 @@ class LockAdvertisement(Advertisement):
 		token = generate_token(self.session_key, self.nonce)
 		logger.debug("Generated advertisement token: %s", token.hex())
 		super().__init__(
-			localName="BLELock",
+			localName="Unlocker",
 			serviceUUIDs=["180D"],
 			appearance=0x0340,
 			timeout=ADVERT_TIMEOUT,
