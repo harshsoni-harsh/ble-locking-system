@@ -19,7 +19,7 @@ from lock.core import (
     validate_token,
 )
 
-MQTT_BROKER = "10.0.15.108"
+MQTT_BROKER = "10.0.10.142"
 MQTT_PORT = 1883
 LOCK_ID = "lock_01"
 DEFAULT_RSSI_THRESHOLD = -70

@@ -1,180 +1,99 @@
-# BLE Locking System - Architecture and Flow Documentation
+# BLE Locking System
 
 ## Overview
-This project implements a secure BLE-based locking system using MQTT for session key delivery and RSA encryption for key security. The system consists of three main components: Backend (session key issuer), Lock (BLE scanner), and Guest (advertiser app). Communication is limited to BLE advertisements and MQTT protocols.
+This project prototypes a secure BLE locking system where phones obtain short-lived unlock credentials over Bluetooth Low Energy and present rolling advertisements that locks can verify. A backend service issues the credentials, advertises itself as a provisioning beacon, and pushes encrypted session material to locks over MQTT so they can validate guest beacons.
 
-## Architecture Components
+The repository contains three runnable roles plus supporting utilities:
 
-### 1. Backend (session_key_issuer.py)
-- **Role**: Issues session keys on demand via MQTT
-- **Responsibilities**:
-  - Listens for session key requests on MQTT topic `backend/session_requests`
-  - Generates random 32-byte session keys
-  - Encrypts session key for lock using RSA-OAEP
-  - Signs the payload with backend RSA private key
-  - Publishes encrypted key to `locks/{lock_id}/session`
-  - Publishes plain key to `guests/{lock_id}/session`
+- **Backend issuer** (`backend/issuer.py`): Advertises a BLE provisioning service and issues session keys.
+- **Guest unlocker** (`guest/unlocker.py`): Scans for the issuer beacon, provisions a session over GATT, and advertises rolling tokens.
+- **Lock scanners** (`lock/lock.py` and `lock/multi_user_lock.py`): Subscribe to encrypted sessions via MQTT and verify BLE advertisements from provisioned phones.
 
-### 2. Lock (lock.py)
-- **Role**: BLE scanner that detects and validates guest advertisements
-- **Responsibilities**:
-  - Subscribes to MQTT topic `locks/{lock_id}/session` for encrypted session keys
-  - Decrypts session keys using lock's RSA private key
-  - Scans for BLE advertisements from guests
-  - Validates HMAC token in advertisement local name
-  - Triggers unlock if token is valid
-  - Validates session key expiry
+## Architecture
 
-### 3. Guest (ble_unlock_app.py)
-- **Role**: App that requests session key and advertises unlock token
-- **Responsibilities**:
-  - Publishes request to `backend/session_requests` with lock_id
-  - Subscribes to `guests/{lock_id}/session` for session key
-  - Generates HMAC token using session key
-  - Advertises with token in manufacturer data (company ID 0xFFFF)
-  - Validates session key expiry
+### Backend (`backend/issuer.py`)
+- Hosts an always-on BLE advertisement so guests can discover the provisioning beacon.
+- Exposes a GATT characteristic; guests write a JSON request containing `lock_id` (and optionally time/MAC).
+- Issues a fresh 32-byte session key, encrypts and signs a payload for the lock, and publishes it to `locks/{lock_id}/session` via MQTT.
+- Returns the plaintext session key, expiry, nonce, and optional clock offset to the guest over the notification channel.
+- Resolves the guest’s Bluetooth MAC through D-Bus when available so locks can bind sessions to devices.
 
-### 4. MQTT Broker
-- **Role**: Message broker for secure key delivery
-- **Configuration**: Mosquitto with anonymous access enabled
+### Guest (`guest/unlocker.py`)
+- Scans continuously until it discovers the issuer beacon (matching by address, name, or manufacturer data).
+- Connects to the provisioning characteristic, writes a request, and waits for the session response.
+- Generates time-based HMAC tokens (rolling every `ADVERT_INTERVAL` seconds) and advertises them in manufacturer data (company ID `0xFFFF`).
+- Refreshes the advertisement payload periodically until the server-declared expiry is reached.
+
+### Lock (`lock/lock.py`)
+- Subscribes to `locks/{lock_id}/session`, decrypts the RSA-encrypted session key, and caches the active session.
+- Uses `bleak` to scan for advertisements containing the expected manufacturer data.
+- Checks RSSI thresholds, optional phone MAC binding, session expiry, and HMAC validity before reporting an unlock event.
+
+### Multi-User Lock (`lock/multi_user_lock.py`)
+- Variation that manages multiple simultaneous sessions keyed by phone MAC addresses.
+- Allows per-phone RSSI thresholds via the `AUTHORIZED_PHONES` dictionary.
 
 ## Security Features
-- **RSA Encryption**: Session keys encrypted for lock using RSA-OAEP
-- **Digital Signatures**: Payloads signed with PSS padding
-- **HMAC Tokens**: Advertisement tokens use HMAC-SHA256
-- **Session Key Expiry**: Keys valid for 5 minutes
-- **Nonce**: Prevents replay attacks
+- **RSA-OAEP + RSA-PSS** protect and authenticate session payloads sent toward locks.
+- **HMAC-SHA256** rolling tokens with nonce + time resist replay attacks.
+- **Short-lived sessions** (default 5 minutes) limit exposure.
+- **Optional MAC binding** lets the backend tie sessions to the phone that provisioned them.
 
-### Detailed Flow Steps:
-1. **Session Key Request**:
-   - Guest publishes `{"lock_id": "lock_01"}` to `backend/session_requests`
+## Prerequisites
+- Linux host with BLE adapter and BlueZ (version supporting LE Peripheral).
+- Python 3.10+ (tested with 3.13 on Ubuntu).
+- An MQTT broker (Mosquitto works well).
 
-2. **Key Generation**:
-   - Backend generates 32-byte random session key
-   - Encrypts with lock's RSA public key
-   - Signs payload with backend private key
-   - Publishes encrypted payload to `locks/lock_01/session`
-   - Publishes plain session key to `guests/lock_01/session`
-
-3. **Key Reception**:
-   - Lock receives encrypted key, decrypts with private key
-   - Guest receives plain key
-
-4. **BLE Unlock**:
-   - Guest generates HMAC-SHA256(session_key, "unlock")[:16]
-   - Guest advertises with manufacturer data containing the token (company ID 0xFFFF)
-   - Lock scans for advertisements
-   - Lock extracts token from manufacturer data
-   - Lock verifies token matches expected HMAC
-   - If valid, unlock successful
-
-## Setup Instructions
-
-### Prerequisites
-- Linux with BlueZ (BLE support)
-- Python 3.8+
-- MQTT broker (Mosquitto)
-
-### Installation
-1. **Clone repository**:
+## Installation
+1. Clone and install requirements:
    ```bash
-   git clone <repo-url>
+   git clone https://github.com/harshsoni-harsh/ble-locking-system.git
    cd ble-locking-system
-   ```
-
-2. **Install dependencies**:
-   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
-
-3. **Install and configure MQTT broker**:
+2. Ensure the broker is running and reachable. For local testing:
    ```bash
    sudo apt install mosquitto
-   sudo nano /etc/mosquitto/mosquitto.conf
+   sudo systemctl enable --now mosquitto
    ```
-   Add:
-   ```
-   listener 1883 0.0.0.0
-   allow_anonymous true
-   ```
+3. Confirm RSA key material exists in `keys/`. Generate replacements as needed (2048-bit minimum) for backend and each lock ID.
+
+## End-to-End Flow
+1. **Start backend issuer**:
    ```bash
-   sudo systemctl restart mosquitto
+   python backend/issuer.py
    ```
-
-4. **Configure network**:
-   - Update `MQTT_BROKER` in all scripts to the broker's IP address
-   - Ensure firewall allows port 1883
-
-### Key Generation
-RSA keys are pre-generated in the code. For production:
-- Generate new RSA keypairs for backend and each lock
-- Update `DEVICE_REGISTRY` in `session_key_issuer.py`
-- Update `LOCK_PRIVATE_KEY_PEM` in `lock.py`
-
-## Testing Instructions
-
-### Single Machine Test
-1. **Start MQTT broker**:
+   Logs should note the advertising adapter and provisioning service registration.
+2. **Start lock** on the device near the door:
    ```bash
-   mosquitto
+   python lock/lock.py
    ```
-
-2. **Start backend**:
+   It subscribes to the MQTT session topic and begins scanning.
+3. **Run guest unlocker** (phone simulator):
    ```bash
-   python session_key_issuer.py
+   python guest/unlocker.py
    ```
+   The guest discovers the issuer beacon, negotiates a session, and starts advertising tokens.
+4. The lock receives the encrypted session from MQTT, validates advertisements, and logs successful unlocks when tokens match.
 
-3. **Start lock**:
-   ```bash
-   python lock.py
-   ```
-   (Requires BLE hardware/adapter for scanning)
+For multi-user setups, run `python lock/multi_user_lock.py` instead and populate `AUTHORIZED_PHONES` with allowed MAC addresses and thresholds.
 
-4. **Run guest app**:
-   ```bash
-   python ble_unlock_app.py
-   ```
-   (Requires BLE hardware/adapter for advertising)
-
-### Multi-Machine Test
-- Run backend and MQTT broker on server
-- Run lock on device with BLE for scanning
-- Run guest on device with BLE for advertising
-
-### Expected Output
-- Backend: "Backend listening for session requests on backend/session_requests"
-- Lock: "Subscribed to locks/lock_01/session for session keys" + BLE scan messages
-- Guest: "Requested session key", "Received session key", then "Advertising with token"
+## Testing Tips
+- Use `bluetoothctl show` and `bluetoothctl scan on` to confirm adapters are powered and visible.
+- `sudo btmon` is helpful to inspect raw BLE traffic when debugging advertisement payloads.
+- If the guest cannot register its advert, check BlueZ experimental mode and ensure payload size ≤ 31 bytes.
+- When provisioning fails, verify the provisioning characteristic UUIDs match between backend and guest.
 
 ## Troubleshooting
+- **MQTT timeouts**: confirm broker reachability, check credentials/firewall, and verify `MQTT_BROKER` values.
+- **BLE scan finds no issuer**: confirm backend advert is live (`sudo btmon`), adjust `ISSUER_SCAN_TIMEOUT`, or supply the beacon’s MAC via `ISSUER_BEACON_ADDRESS`.
+- **Provisioning GATT write errors**: BlueZ must run with `--experimental`; also ensure only one process is advertising on the adapter.
+- **Clock skew errors**: the backend returns `clock_offset`; use it to adjust token generation logic if needed.
 
-### MQTT Connection Issues
-- Check broker IP and port
-- Verify `mosquitto` is running: `sudo systemctl status mosquitto`
-- Test connection: `mosquitto_sub -h <broker_ip> -t test`
+## Future Improvements
+- Persist sessions and audit logs on the backend.
+- Evaluate distance estimation by embedding calibrated Tx power in adverts.
+- Harden MQTT transport with TLS and credentials.
 
-### BLE Issues
-- Check BlueZ: `bluetoothctl show`
-- Ensure BLE adapter: `hciconfig`
-- Permissions: Run with sudo if needed
-- For advertising (guest): Ensure bluez-peripheral can access BLE
-- For scanning (lock): Ensure bleak can access BLE
-
-### Key Errors
-- Verify RSA keys are correct format
-- Check expiry times
-- Ensure cryptography library installed
-
-## Security Considerations
-- Use strong RSA keys (2048+ bits)
-- Implement proper authentication for guest requests
-- Rotate session keys frequently
-- Monitor MQTT traffic
-- Use TLS for MQTT in production
-
-## Future Enhancements
-- Add user authentication
-- Implement lock status publishing
-- Add multiple lock support
-- Integrate with mobile apps
-- Add audit logging
