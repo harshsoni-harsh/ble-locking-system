@@ -160,7 +160,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
 
     fun getSessionKey(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            _uiState.update { it.copy(isGettingKey = true, hasSessionKey = false) }
+            _uiState.update { it.copy(isGettingKey = true, hasSessionKey = false, sessionExpiryTime = 0L) }
             log("Scanning for issuer beacon...")
 
             val config = uiState.value
@@ -176,7 +176,8 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                 if (nonce != null) {
                     log("Nonce: $nonce")
                 }
-                _uiState.update { it.copy(hasSessionKey = true) }
+                // *** MODIFIED: Update UI state with expiry time ***
+                _uiState.update { it.copy(hasSessionKey = true, sessionExpiryTime = expiry) }
 
             } catch (e: Exception) {
                 if (e is CancellationException) {
@@ -215,8 +216,8 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
 
                         // Check if this matches our issuer beacon
                         val nameMatch = if (config.issuerBeaconName.isNotEmpty()) {
-                            device.name == config.issuerBeaconName || 
-                            scanRecord?.deviceName == config.issuerBeaconName
+                            device.name == config.issuerBeaconName ||
+                                    scanRecord?.deviceName == config.issuerBeaconName
                         } else false
 
                         val addressMatch = if (config.issuerBeaconAddress.isNotEmpty()) {
@@ -370,8 +371,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                         }
                         gatt?.disconnect()
                     }
-                } else {365
-
+                } else {
                     if (continuation.isActive) {
                         continuation.resumeWithException(
                             Exception("Service discovery failed: $status")
@@ -382,26 +382,26 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             }
 
             override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                viewModelScope.launch {
+                    responseChannel.send(value)
+                }
+            }
+
+            @Deprecated("Deprecated in API 33")
+            override fun onCharacteristicChanged(
                 gatt: BluetoothGatt?,
                 characteristic: BluetoothGattCharacteristic?
             ) {
-                characteristic?.value?.let { data ->
+                 characteristic?.value?.let { data ->
                     viewModelScope.launch {
                         responseChannel.send(data)
                     }
                 }
             }
-
-//            @Deprecated("Deprecated in API 33")
-//            override fun onCharacteristicChanged(
-//                gatt: BluetoothGatt?,
-//                characteristic: BluetoothGattCharacteristic?,
-//                value: ByteArray
-//            ) {
-//                viewModelScope.launch {
-//                    responseChannel.send(value)
-//                }
-//            }
         }
 
         try {
@@ -470,6 +470,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    // *** MODIFIED: Reworked start/stop logic ***
     fun startAdvertisingLoop(context: Context) {
         if (uiState.value.isAdvertising) {
             log("Already advertising.")
@@ -479,6 +480,19 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             log("Error: Must get session key before advertising.")
             return
         }
+        // Check for expiry *before* starting
+        val currentTime = System.currentTimeMillis() / 1000L
+        val remaining = sessionExpiry - currentTime
+        if (sessionExpiry != 0L && remaining <= 0) {
+            log("Error: Session key has already expired. Get a new key.")
+            // Clear the expired key
+            _uiState.update { it.copy(hasSessionKey = false, sessionExpiryTime = 0L) }
+            sessionKey = null
+            sessionExpiry = 0L
+            nonce = null
+            return
+        }
+
         if (!isBleAdapterEnabled(context)) {
             log("Error: Bluetooth is not enabled.")
             return
@@ -488,19 +502,43 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         log("Starting advertising loop...")
 
         advertiserJob = viewModelScope.launch(Dispatchers.IO) {
+            var keyExpired = false
             try {
-                advertisingLoopInternal(context, uiState.value)
+                // Pass a lambda to be called if the key expires during the loop
+                advertisingLoopInternal(context, uiState.value) {
+                    keyExpired = true
+                }
+
+                // This code runs if the loop finishes *without* cancellation
+                if (keyExpired) {
+                    log("Session expired. Clearing key.")
+                    _uiState.update { it.copy(isAdvertising = false, hasSessionKey = false, sessionExpiryTime = 0L) }
+                    sessionKey = null
+                    sessionExpiry = 0L
+                    nonce = null
+                } else {
+                    // This shouldn't happen unless loop is changed, but good to handle
+                    log("Advertising loop finished unexpectedly.")
+                    _uiState.update { it.copy(isAdvertising = false) }
+                }
+
             } catch (e: CancellationException) {
+                // This runs when stopAdvertisingLoop() is called
                 log("Advertising stopped by user.")
+                // Update advertising state, but *keep* the session key
+                _uiState.update { it.copy(isAdvertising = false) }
             } catch (e: Exception) {
+                // This runs on any other error
                 log("Advertising loop error: ${e.message}")
-            } finally {
-                log("Cleaning up advertising...")
-                stopBleAdvertising()
-                _uiState.update { it.copy(isAdvertising = false, hasSessionKey = false) }
+                // An error occurred, clear the key
+                _uiState.update { it.copy(isAdvertising = false, hasSessionKey = false, sessionExpiryTime = 0L) }
                 sessionKey = null
                 sessionExpiry = 0L
                 nonce = null
+            } finally {
+                // This *always* runs to ensure BLE advertising is stopped
+                log("Cleaning up advertising hardware...")
+                stopBleAdvertising()
             }
         }
     }
@@ -510,7 +548,11 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun advertisingLoopInternal(context: Context, config: AdvertiserUiState) {
+    private suspend fun advertisingLoopInternal(
+        context: Context,
+        config: AdvertiserUiState,
+        onKeyExpired: () -> Unit // *** MODIFIED: Added lambda ***
+    ) {
         val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bleAdvertiser = btManager.adapter.bluetoothLeAdvertiser
         if (bleAdvertiser == null) {
@@ -523,6 +565,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             val remaining = sessionExpiry - currentTime
             if (sessionExpiry != 0L && remaining <= 0) {
                 log("Session key expired. Stopping.")
+                onKeyExpired() // *** MODIFIED: Call lambda ***
                 break
             }
 
@@ -613,6 +656,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         joinToString(separator = "") { eachByte -> "%02x".format(eachByte) }
 }
 
+// *** MODIFIED: Added sessionExpiryTime ***
 data class AdvertiserUiState(
     val lockId: String = "loading...",
     val issuerBeaconName: String = "loading...",
@@ -621,6 +665,7 @@ data class AdvertiserUiState(
     val isGettingKey: Boolean = false,
     val isAdvertising: Boolean = false,
     val hasSessionKey: Boolean = false,
+    val sessionExpiryTime: Long = 0L, // Timestamp of expiry
     val logs: List<String> = emptyList()
 )
 
@@ -816,11 +861,11 @@ fun ConfigEditor(
     onSave: (String, String, String, String) -> Unit
 ) {
     var draftLockId by remember(uiState.lockId) { mutableStateOf(uiState.lockId) }
-    var draftBeaconName by remember(uiState.issuerBeaconName) { 
-        mutableStateOf(uiState.issuerBeaconName) 
+    var draftBeaconName by remember(uiState.issuerBeaconName) {
+        mutableStateOf(uiState.issuerBeaconName)
     }
-    var draftBeaconAddress by remember(uiState.issuerBeaconAddress) { 
-        mutableStateOf(uiState.issuerBeaconAddress) 
+    var draftBeaconAddress by remember(uiState.issuerBeaconAddress) {
+        mutableStateOf(uiState.issuerBeaconAddress)
     }
     var draftAdvertInterval by remember(uiState.advertInterval) {
         mutableStateOf(uiState.advertInterval.toString())
@@ -869,6 +914,7 @@ fun ConfigEditor(
     }
 }
 
+// *** MODIFIED: Reworked ControlPanel to show expiry time ***
 @Composable
 fun ControlPanel(
     uiState: AdvertiserUiState,
@@ -877,42 +923,98 @@ fun ControlPanel(
     onStop: () -> Unit
 ) {
     val isBusy = uiState.isAdvertising || uiState.isGettingKey
+    val expiryTime = uiState.sessionExpiryTime
+    var remainingTime by remember { mutableStateOf<Long?>(null) }
 
-    Row(
+    // This effect runs when expiryTime changes. It updates the
+    // remaining time every second.
+    LaunchedEffect(expiryTime) {
+        if (expiryTime == 0L) {
+            remainingTime = null
+            return@LaunchedEffect
+        }
+
+        while (isActive) {
+            val current = System.currentTimeMillis() / 1000L
+            val remaining = expiryTime - current
+            remainingTime = if (remaining > 0) remaining else 0L
+
+            if (remaining <= 0) {
+                // Stop the countdown, the ViewModel will handle the
+                // actual expiry logic and reset expiryTime to 0.
+                break
+            }
+            delay(1000L)
+        }
+    }
+
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-        verticalAlignment = Alignment.CenterVertically
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Box(contentAlignment = Alignment.Center) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Button(
+                    onClick = onGetKey,
+                    enabled = !isBusy
+                ) {
+                    Text("Get Session Key")
+                }
+                if (uiState.isGettingKey) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                }
+            }
+
             Button(
-                onClick = onGetKey,
-                enabled = !isBusy
+                onClick = onStart,
+                enabled = !isBusy && uiState.hasSessionKey
             ) {
-                Text("Get Session Key")
+                Text("Start Advert")
             }
-            if (uiState.isGettingKey) {
-                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+
+            Button(
+                onClick = onStop,
+                enabled = uiState.isAdvertising,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error
+                )
+            ) {
+                Text("Stop Advert")
             }
         }
 
-        Button(
-            onClick = onStart,
-            enabled = !isBusy && uiState.hasSessionKey
-        ) {
-            Text("Start Advert")
-        }
-
-        Button(
-            onClick = onStop,
-            enabled = uiState.isAdvertising,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.error
-            )
-        ) {
-            Text("Stop Advert")
+        // Show the remaining time
+        remainingTime?.let {
+            if (it > 0 || uiState.isAdvertising) { // Show "00:00" briefly if still advertising
+                Spacer(Modifier.height(12.dp))
+                val timeColor = if (it < 60 && it > 0) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+                }
+                Text(
+                    text = "Key expires in: ${formatRemainingTime(it)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = timeColor
+                )
+            }
         }
     }
 }
+
+/**
+ * Formats a duration in seconds into MM:SS string.
+ */
+private fun formatRemainingTime(totalSeconds: Long): String {
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
+}
+
 
 @Composable
 fun ConfigTextField(
