@@ -251,10 +251,13 @@ class ProvisioningService(Service):
 		self._issuer = issuer
 		self._response: bytes = b""
 		self._bus: Optional[MessageBus] = None
+		self._loop: Optional[asyncio.AbstractEventLoop] = None
 		super().__init__(PROVISIONING_SERVICE_UUID)
 
 	def attach_bus(self, bus: MessageBus) -> None:
 		self._bus = bus
+		with suppress(RuntimeError):
+			self._loop = asyncio.get_running_loop()
 
 	@exchange_char
 	def _read_exchange(self, options: CharacteristicReadOptions) -> bytes:
@@ -295,18 +298,33 @@ class ProvisioningService(Service):
 			logger.warning("Failed to resolve device address for %s: %s", device_path, exc)
 			return None
 
-	def _finalize_exchange_task(self, task: "asyncio.Task[None]") -> None:
+	def _finalize_exchange_future(self, future: Any) -> None:
 		try:
-			task.result()
+			future.result()
 		except Exception as exc:  # pragma: no cover - background task
 			logger.exception("Provisioning write task failed: %s", exc)
 
 	@exchange_char.setter
 	def _write_exchange(self, data: bytes, options: CharacteristicWriteOptions) -> None:
-		task = asyncio.create_task(
-			self._process_exchange_write(bytes(data), options)
-		)
-		task.add_done_callback(self._finalize_exchange_task)
+		coro = self._process_exchange_write(bytes(data), options)
+		loop = self._loop
+		if loop is None:
+			try:
+				loop = asyncio.get_running_loop()
+			except RuntimeError:
+				loop = None
+		if loop is None or loop.is_closed():
+			raise RuntimeError("Provisioning loop not available")
+		try:
+			current_loop = asyncio.get_running_loop()
+		except RuntimeError:
+			current_loop = None
+		if current_loop is loop:
+			task = loop.create_task(coro)
+			task.add_done_callback(self._finalize_exchange_future)
+		else:
+			future = asyncio.run_coroutine_threadsafe(coro, loop)
+			future.add_done_callback(self._finalize_exchange_future)
 
 	async def _handle_request(
 		self,
