@@ -28,15 +28,22 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.datastore.core.DataStore
@@ -49,6 +56,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import kotlinx.coroutines.NonCancellable.isActive
 import kotlinx.coroutines.channels.Channel
@@ -68,16 +77,25 @@ import kotlin.math.min
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
-private val LOCK_ID_KEY = stringPreferencesKey("lock_id")
-private val ISSUER_BEACON_NAME_KEY = stringPreferencesKey("issuer_beacon_name")
-private val ISSUER_BEACON_ADDRESS_KEY = stringPreferencesKey("issuer_beacon_address")
-private val ADVERT_INTERVAL_KEY = stringPreferencesKey("advert_interval")
+
+private val SAVED_LOCKS_KEY = stringPreferencesKey("saved_locks_json")
+private val LAST_ACTIVE_LOCK_ID_KEY = stringPreferencesKey("last_active_lock_id")
 
 private const val MANUFACTURER_ID = 0xFFFF
 private const val SERVICE_UUID = "0000180D-0000-1000-8000-00805F9B34FB"
 private const val PROVISIONING_SERVICE_UUID = "c0de0001-0000-1000-8000-00805f9b34fb"
 private const val PROVISIONING_CHARACTERISTIC_UUID = "c0de0002-0000-1000-8000-00805f9b34fb"
 private const val TAG = "BleAdvertiser"
+
+data class SavedLock(
+    val lockId: String,
+    val issuerBeaconName: String,
+    val issuerBeaconAddress: String,
+    val advertInterval: Long,
+    val sessionKeyB64: String?, // Store key as Base64 string for JSON
+    val sessionExpiry: Long,
+    val nonce: String?
+)
 
 class AdvertiserViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -88,35 +106,102 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
     private var advertiserJob: Job? = null
     private var bleAdvertiser: BluetoothLeAdvertiser? = null
     private var bleScanner: BluetoothLeScanner? = null
+
     private var sessionKey: ByteArray? = null
     private var sessionExpiry: Long = 0L
     private var nonce: String? = null
 
+    private val gson = Gson()
+
     init {
         log("ViewModel initializing...")
         viewModelScope.launch {
-            val savedConfig = loadConfig()
-            _uiState.update {
-                it.copy(
-                    lockId = savedConfig.lockId,
-                    issuerBeaconName = savedConfig.issuerBeaconName,
-                    issuerBeaconAddress = savedConfig.issuerBeaconAddress,
-                    advertInterval = savedConfig.advertInterval
-                )
-            }
-            log("Saved configuration loaded.")
+            loadDataFromStore()
         }
     }
 
-    private suspend fun loadConfig(): SavedConfig {
+    private suspend fun loadDataFromStore() {
+        val savedLocks = loadSavedLocksFromStore()
+        _uiState.update { it.copy(savedLocks = savedLocks) }
+
+        val lastActiveLockId = dataStore.data.map { it[LAST_ACTIVE_LOCK_ID_KEY] }.first()
+        val lastActiveLock = savedLocks.find { it.lockId == lastActiveLockId }
+
+        if (lastActiveLock != null) {
+            log("Loading last active lock: ${lastActiveLock.lockId}")
+            loadLock(lastActiveLock)
+        } else if (savedLocks.isNotEmpty()) {
+            log("Loading first available lock: ${savedLocks.first().lockId}")
+            loadLock(savedLocks.first())
+        } else {
+            log("No saved locks found. Using defaults.")
+
+            _uiState.update {
+                it.copy(
+                    lockId = "my-new-lock",
+                    issuerBeaconName = "IssuerBeacon",
+                    issuerBeaconAddress = "",
+                    advertInterval = 5L,
+                    hasSessionKey = false,
+                    sessionExpiryTime = 0L
+                )
+            }
+        }
+    }
+
+    private suspend fun loadSavedLocksFromStore(): List<SavedLock> {
         return dataStore.data.map { prefs ->
-            SavedConfig(
-                lockId = prefs[LOCK_ID_KEY] ?: "lock_02",
-                issuerBeaconName = prefs[ISSUER_BEACON_NAME_KEY] ?: "IssuerBeacon",
-                issuerBeaconAddress = prefs[ISSUER_BEACON_ADDRESS_KEY] ?: "",
-                advertInterval = prefs[ADVERT_INTERVAL_KEY]?.toLongOrNull() ?: 5L
-            )
+            val json = prefs[SAVED_LOCKS_KEY]
+            if (json.isNullOrEmpty()) {
+                emptyList()
+            } else {
+                try {
+                    val type = object : TypeToken<List<SavedLock>>() {}.type
+                    gson.fromJson<List<SavedLock>>(json, type)
+                } catch (e: Exception) {
+                    log("Error parsing saved locks: ${e.message}")
+                    emptyList()
+                }
+            }
         }.first()
+    }
+
+    private suspend fun saveLocksToStore(locks: List<SavedLock>) {
+        val json = gson.toJson(locks)
+        dataStore.edit { prefs ->
+            prefs[SAVED_LOCKS_KEY] = json
+        }
+        _uiState.update { it.copy(savedLocks = locks) }
+    }
+
+    private suspend fun saveCurrentLockProfile() {
+        val currentState = _uiState.value
+        val currentLock = SavedLock(
+            lockId = currentState.lockId,
+            issuerBeaconName = currentState.issuerBeaconName,
+            issuerBeaconAddress = currentState.issuerBeaconAddress,
+            advertInterval = currentState.advertInterval,
+            sessionKeyB64 = sessionKey?.let { Base64.getEncoder().encodeToString(it) },
+            sessionExpiry = sessionExpiry,
+            nonce = nonce
+        )
+
+        val currentLocks = loadSavedLocksFromStore().toMutableList()
+        val existingIndex = currentLocks.indexOfFirst { it.lockId == currentLock.lockId }
+
+        if (existingIndex != -1) {
+            currentLocks[existingIndex] = currentLock // Update
+            log("Updated lock profile: ${currentLock.lockId}")
+        } else {
+            currentLocks.add(currentLock) // Add new
+            log("Saved new lock profile: ${currentLock.lockId}")
+        }
+
+        saveLocksToStore(currentLocks)
+
+        dataStore.edit { prefs ->
+            prefs[LAST_ACTIVE_LOCK_ID_KEY] = currentLock.lockId
+        }
     }
 
     private fun log(message: String) {
@@ -130,33 +215,83 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun onSaveConfig(
+    fun saveLockProfile(
         lockId: String,
         issuerBeaconName: String,
         issuerBeaconAddress: String,
         advertInterval: String
     ) {
-        val interval = advertInterval.toLongOrNull() ?: uiState.value.advertInterval
-
         viewModelScope.launch(Dispatchers.IO) {
+            val interval = advertInterval.toLongOrNull() ?: _uiState.value.advertInterval
+            val oldLockId = _uiState.value.lockId
+
+            _uiState.update {
+                it.copy(
+                    lockId = lockId,
+                    issuerBeaconName = issuerBeaconName,
+                    issuerBeaconAddress = issuerBeaconAddress,
+                    advertInterval = interval
+                )
+            }
+
+            if (oldLockId != lockId) {
+                log("Lock ID changed. Clearing session.")
+                sessionKey = null
+                sessionExpiry = 0L
+                nonce = null
+                _uiState.update { it.copy(hasSessionKey = false, sessionExpiryTime = 0L) }
+            }
+
+            saveCurrentLockProfile()
+        }
+    }
+
+    fun onLockSelected(lock: SavedLock) {
+        log("Loading lock: ${lock.lockId}")
+        if (uiState.value.isAdvertising) {
+            log("Cannot load lock while advertising. Stop first.")
+            return
+        }
+        loadLock(lock)
+        viewModelScope.launch {
             dataStore.edit { prefs ->
-                prefs[LOCK_ID_KEY] = lockId
-                prefs[ISSUER_BEACON_NAME_KEY] = issuerBeaconName
-                prefs[ISSUER_BEACON_ADDRESS_KEY] = issuerBeaconAddress
-                prefs[ADVERT_INTERVAL_KEY] = interval.toString()
+                prefs[LAST_ACTIVE_LOCK_ID_KEY] = lock.lockId
             }
         }
+    }
+
+    private fun loadLock(lock: SavedLock) {
+        stopAdvertisingLoop()
 
         _uiState.update {
             it.copy(
-                lockId = lockId,
-                issuerBeaconName = issuerBeaconName,
-                issuerBeaconAddress = issuerBeaconAddress,
-                advertInterval = interval
+                lockId = lock.lockId,
+                issuerBeaconName = lock.issuerBeaconName,
+                issuerBeaconAddress = lock.issuerBeaconAddress,
+                advertInterval = lock.advertInterval
             )
         }
-        log("Configuration saved.")
+
+        sessionKey = lock.sessionKeyB64?.let { Base64.getDecoder().decode(it) }
+        sessionExpiry = lock.sessionExpiry
+        nonce = lock.nonce
+
+        val currentTime = System.currentTimeMillis() / 1000L
+        val isExpired = sessionExpiry != 0L && sessionExpiry <= currentTime
+        val hasValidKey = sessionKey != null && !isExpired
+
+        if (hasValidKey) {
+            log("Loaded valid session key for ${lock.lockId}.")
+            _uiState.update { it.copy(hasSessionKey = true, sessionExpiryTime = sessionExpiry) }
+        } else {
+            log("No valid session key for ${lock.lockId}.")
+            sessionKey = null
+            sessionExpiry = 0L
+            nonce = null
+            _uiState.update { it.copy(hasSessionKey = false, sessionExpiryTime = 0L) }
+        }
     }
+
 
     fun getSessionKey(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -171,13 +306,14 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                 sessionKey = key
                 sessionExpiry = expiry
                 this@AdvertiserViewModel.nonce = nonce
+
                 log("Session key received. Expires: $expiry")
                 log("Key (Base64): ${Base64.getEncoder().encodeToString(key)}")
-                if (nonce != null) {
-                    log("Nonce: $nonce")
-                }
-                // *** MODIFIED: Update UI state with expiry time ***
+                if (nonce != null) { log("Nonce: $nonce") }
+
                 _uiState.update { it.copy(hasSessionKey = true, sessionExpiryTime = expiry) }
+
+                saveCurrentLockProfile()
 
             } catch (e: Exception) {
                 if (e is CancellationException) {
@@ -214,7 +350,6 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                         val device = scanResult.device
                         val scanRecord = scanResult.scanRecord
 
-                        // Check if this matches our issuer beacon
                         val nameMatch = if (config.issuerBeaconName.isNotEmpty()) {
                             device.name == config.issuerBeaconName ||
                                     scanRecord?.deviceName == config.issuerBeaconName
@@ -230,7 +365,6 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                             log("Found issuer beacon: ${device.name ?: "unknown"} (${device.address})")
                             bleScanner?.stopScan(this)
 
-                            // Connect and provision
                             viewModelScope.launch(Dispatchers.IO) {
                                 try {
                                     val result = connectAndProvision(context, device, config.lockId)
@@ -260,8 +394,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                 .build()
 
             val filters = mutableListOf<ScanFilter>()
-            
-            // Add manufacturer data filter
+
             filters.add(
                 ScanFilter.Builder()
                     .setManufacturerData(MANUFACTURER_ID, ByteArray(0))
@@ -320,10 +453,8 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                     )
 
                     if (characteristic != null) {
-                        // Enable notifications
                         gatt?.setCharacteristicNotification(characteristic, true)
-                        
-                        // Write descriptor to enable notifications
+
                         val descriptor = characteristic.getDescriptor(
                             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
                         )
@@ -332,17 +463,15 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                                 gatt?.writeDescriptor(it, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                             } else {
                                 @Suppress("DEPRECATION")
-                                it.value = BluetoothGattDescriptor
-                                    .ENABLE_NOTIFICATION_VALUE
+                                it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                                 @Suppress("DEPRECATION")
                                 gatt?.writeDescriptor(it)
                             }
                         }
 
-                        // Send provisioning request
                         viewModelScope.launch {
-                            delay(500) // Give time for notifications to be enabled
-                            
+                            delay(500)
+
                             val request = JSONObject().apply {
                                 put("lock_id", lockId)
                                 put("client_time", System.currentTimeMillis() / 1000)
@@ -396,7 +525,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                 gatt: BluetoothGatt?,
                 characteristic: BluetoothGattCharacteristic?
             ) {
-                 characteristic?.value?.let { data ->
+                characteristic?.value?.let { data ->
                     viewModelScope.launch {
                         responseChannel.send(data)
                     }
@@ -408,7 +537,6 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             log("Connecting to issuer beacon...")
             gatt = device.connectGatt(context, false, gattCallback)
 
-            // Wait for response with timeout
             viewModelScope.launch {
                 try {
                     withTimeout(15_000L) {
@@ -420,7 +548,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                             val key = Base64.getDecoder().decode(keyB64)
                             val expiry = response.optLong("expiry", 0L)
                             val nonce = response.optString("nonce", null)
-                            
+
                             val clockOffset = response.optInt("clock_offset", 0)
                             if (clockOffset != 0) {
                                 log("Issuer reported clock offset: $clockOffset")
@@ -435,7 +563,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                                 continuation.resumeWithException(Exception("Provisioning failed: $errorMsg"))
                             }
                         }
-                        
+
                         gatt?.disconnect()
                     }
                 } catch (e: TimeoutCancellationException) {
@@ -470,7 +598,6 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    // *** MODIFIED: Reworked start/stop logic ***
     fun startAdvertisingLoop(context: Context) {
         if (uiState.value.isAdvertising) {
             log("Already advertising.")
@@ -480,16 +607,15 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             log("Error: Must get session key before advertising.")
             return
         }
-        // Check for expiry *before* starting
         val currentTime = System.currentTimeMillis() / 1000L
         val remaining = sessionExpiry - currentTime
         if (sessionExpiry != 0L && remaining <= 0) {
             log("Error: Session key has already expired. Get a new key.")
-            // Clear the expired key
             _uiState.update { it.copy(hasSessionKey = false, sessionExpiryTime = 0L) }
             sessionKey = null
             sessionExpiry = 0L
             nonce = null
+            viewModelScope.launch { saveCurrentLockProfile() }
             return
         }
 
@@ -499,44 +625,38 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         _uiState.update { it.copy(isAdvertising = true) }
-        log("Starting advertising loop...")
+        log("Starting advertising loop for ${uiState.value.lockId}...")
 
         advertiserJob = viewModelScope.launch(Dispatchers.IO) {
             var keyExpired = false
             try {
-                // Pass a lambda to be called if the key expires during the loop
                 advertisingLoopInternal(context, uiState.value) {
                     keyExpired = true
                 }
 
-                // This code runs if the loop finishes *without* cancellation
                 if (keyExpired) {
                     log("Session expired. Clearing key.")
                     _uiState.update { it.copy(isAdvertising = false, hasSessionKey = false, sessionExpiryTime = 0L) }
                     sessionKey = null
                     sessionExpiry = 0L
                     nonce = null
+                    saveCurrentLockProfile()
                 } else {
-                    // This shouldn't happen unless loop is changed, but good to handle
                     log("Advertising loop finished unexpectedly.")
                     _uiState.update { it.copy(isAdvertising = false) }
                 }
 
             } catch (e: CancellationException) {
-                // This runs when stopAdvertisingLoop() is called
                 log("Advertising stopped by user.")
-                // Update advertising state, but *keep* the session key
                 _uiState.update { it.copy(isAdvertising = false) }
             } catch (e: Exception) {
-                // This runs on any other error
                 log("Advertising loop error: ${e.message}")
-                // An error occurred, clear the key
                 _uiState.update { it.copy(isAdvertising = false, hasSessionKey = false, sessionExpiryTime = 0L) }
                 sessionKey = null
                 sessionExpiry = 0L
                 nonce = null
+                saveCurrentLockProfile()
             } finally {
-                // This *always* runs to ensure BLE advertising is stopped
                 log("Cleaning up advertising hardware...")
                 stopBleAdvertising()
             }
@@ -551,7 +671,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
     private suspend fun advertisingLoopInternal(
         context: Context,
         config: AdvertiserUiState,
-        onKeyExpired: () -> Unit // *** MODIFIED: Added lambda ***
+        onKeyExpired: () -> Unit
     ) {
         val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bleAdvertiser = btManager.adapter.bluetoothLeAdvertiser
@@ -565,7 +685,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             val remaining = sessionExpiry - currentTime
             if (sessionExpiry != 0L && remaining <= 0) {
                 log("Session key expired. Stopping.")
-                onKeyExpired() // *** MODIFIED: Call lambda ***
+                onKeyExpired()
                 break
             }
 
@@ -589,11 +709,11 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
     private fun generateToken(advertInterval: Long): ByteArray {
         val key = sessionKey ?: throw IllegalStateException("Session key is null")
         val ts = (System.currentTimeMillis() / 1000L) / advertInterval
-        
+
         val components = mutableListOf<ByteArray>()
         nonce?.let { components.add(it.toByteArray(Charsets.UTF_8)) }
         components.add(ts.toString().toByteArray(Charsets.UTF_8))
-        
+
         val msg = components.reduce { acc, bytes -> acc + bytes }
 
         val mac = Mac.getInstance("HmacSHA256")
@@ -656,7 +776,6 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         joinToString(separator = "") { eachByte -> "%02x".format(eachByte) }
 }
 
-// *** MODIFIED: Added sessionExpiryTime ***
 data class AdvertiserUiState(
     val lockId: String = "loading...",
     val issuerBeaconName: String = "loading...",
@@ -666,15 +785,11 @@ data class AdvertiserUiState(
     val isAdvertising: Boolean = false,
     val hasSessionKey: Boolean = false,
     val sessionExpiryTime: Long = 0L, // Timestamp of expiry
+    // List of all saved locks
+    val savedLocks: List<SavedLock> = emptyList(),
     val logs: List<String> = emptyList()
 )
 
-private data class SavedConfig(
-    val lockId: String,
-    val issuerBeaconName: String,
-    val issuerBeaconAddress: String,
-    val advertInterval: Long
-)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -799,6 +914,8 @@ fun BleAdvertiserScreen(viewModel: AdvertiserViewModel) {
     val context = LocalContext.current
     val logListState = rememberLazyListState()
 
+    val isBusy = uiState.isAdvertising || uiState.isGettingKey
+
     LaunchedEffect(uiState.logs.size) {
         if (uiState.logs.isNotEmpty()) {
             logListState.animateScrollToItem(uiState.logs.size - 1)
@@ -810,27 +927,40 @@ fun BleAdvertiserScreen(viewModel: AdvertiserViewModel) {
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        ConfigEditor(
-            uiState = uiState,
-            onSave = { lockId, beaconName, beaconAddr, interval ->
-                viewModel.onSaveConfig(lockId, beaconName, beaconAddr, interval)
-            }
-        )
 
-        Spacer(Modifier.height(16.dp))
-        Divider()
-        Spacer(Modifier.height(16.dp))
+        Column {
+            ConfigEditor(
+                uiState = uiState,
+                onSave = { lockId, beaconName, beaconAddr, interval ->
+                    viewModel.saveLockProfile(lockId, beaconName, beaconAddr, interval)
+                }
+            )
 
-        ControlPanel(
-            uiState = uiState,
-            onGetKey = { viewModel.getSessionKey(context) },
-            onStart = { viewModel.startAdvertisingLoop(context) },
-            onStop = { viewModel.stopAdvertisingLoop() }
-        )
+            Spacer(Modifier.height(16.dp))
 
-        Spacer(Modifier.height(16.dp))
+            SavedLocksSection(
+                locks = uiState.savedLocks,
+                activeLockId = uiState.lockId,
+                onLockSelected = { viewModel.onLockSelected(it) },
+                enabled = !isBusy
+            )
 
-        Text("Logs", style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(16.dp))
+            Divider()
+            Spacer(Modifier.height(16.dp))
+
+            ControlPanel(
+                uiState = uiState,
+                onGetKey = { viewModel.getSessionKey(context) },
+                onStart = { viewModel.startAdvertisingLoop(context) },
+                onStop = { viewModel.stopAdvertisingLoop() }
+            )
+
+            Spacer(Modifier.height(16.dp))
+
+            Text("Logs", style = MaterialTheme.typography.headlineSmall)
+        }
+
         Card(
             modifier = Modifier
                 .fillMaxSize()
@@ -855,11 +985,88 @@ fun BleAdvertiserScreen(viewModel: AdvertiserViewModel) {
     }
 }
 
+
+@Composable
+fun SavedLocksSection(
+    locks: List<SavedLock>,
+    activeLockId: String,
+    onLockSelected: (SavedLock) -> Unit,
+    enabled: Boolean
+) {
+    var isExpanded by remember { mutableStateOf(false) }
+
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth(),
+//        enabled = enabled
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled) { isExpanded = !isExpanded }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("Saved Locks (${locks.size})", style = MaterialTheme.typography.titleMedium)
+            Icon(
+                imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.ArrowDropDown,
+                contentDescription = if (isExpanded) "Collapse" else "Expand"
+            )
+        }
+
+        AnimatedVisibility(visible = isExpanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                if (locks.isEmpty()) {
+                    Text("No locks saved yet.", modifier = Modifier.padding(bottom = 8.dp))
+                }
+                locks.forEach { lock ->
+                    val isActive = lock.lockId == activeLockId
+                    val fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
+                    val color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = enabled) { onLockSelected(lock) }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Lock",
+                            tint = color.copy(alpha = 0.8f)
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                text = lock.lockId,
+                                fontWeight = fontWeight,
+                                color = color
+                            )
+                            Text(
+                                text = lock.issuerBeaconName,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = color.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
 @Composable
 fun ConfigEditor(
     uiState: AdvertiserUiState,
     onSave: (String, String, String, String) -> Unit
 ) {
+
     var draftLockId by remember(uiState.lockId) { mutableStateOf(uiState.lockId) }
     var draftBeaconName by remember(uiState.issuerBeaconName) {
         mutableStateOf(uiState.issuerBeaconName)
@@ -874,7 +1081,7 @@ fun ConfigEditor(
     val isEnabled = !uiState.isAdvertising && !uiState.isGettingKey
 
     Column {
-        Text("Configuration", style = MaterialTheme.typography.headlineSmall)
+        Text("Active Lock Profile", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(8.dp))
 
         ConfigTextField(
@@ -903,18 +1110,18 @@ fun ConfigEditor(
         )
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = { 
-                onSave(draftLockId, draftBeaconName, draftBeaconAddress, draftAdvertInterval) 
+            onClick = {
+                onSave(draftLockId, draftBeaconName, draftBeaconAddress, draftAdvertInterval)
             },
             enabled = isEnabled,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Save Config")
+
+            Text("Save Lock Profile")
         }
     }
 }
 
-// *** MODIFIED: Reworked ControlPanel to show expiry time ***
 @Composable
 fun ControlPanel(
     uiState: AdvertiserUiState,
@@ -926,8 +1133,6 @@ fun ControlPanel(
     val expiryTime = uiState.sessionExpiryTime
     var remainingTime by remember { mutableStateOf<Long?>(null) }
 
-    // This effect runs when expiryTime changes. It updates the
-    // remaining time every second.
     LaunchedEffect(expiryTime) {
         if (expiryTime == 0L) {
             remainingTime = null
@@ -940,8 +1145,6 @@ fun ControlPanel(
             remainingTime = if (remaining > 0) remaining else 0L
 
             if (remaining <= 0) {
-                // Stop the countdown, the ViewModel will handle the
-                // actual expiry logic and reset expiryTime to 0.
                 break
             }
             delay(1000L)
@@ -987,9 +1190,8 @@ fun ControlPanel(
             }
         }
 
-        // Show the remaining time
         remainingTime?.let {
-            if (it > 0 || uiState.isAdvertising) { // Show "00:00" briefly if still advertising
+            if (it > 0 || uiState.isAdvertising) {
                 Spacer(Modifier.height(12.dp))
                 val timeColor = if (it < 60 && it > 0) {
                     MaterialTheme.colorScheme.error
@@ -1006,9 +1208,7 @@ fun ControlPanel(
     }
 }
 
-/**
- * Formats a duration in seconds into MM:SS string.
- */
+
 private fun formatRemainingTime(totalSeconds: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60

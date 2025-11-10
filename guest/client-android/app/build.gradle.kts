@@ -47,6 +47,7 @@ dependencies {
         implementation("androidx.activity:activity-compose:1.8.0")
 
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+    implementation("com.google.code.gson:gson:2.10.1")
 //        implementation( "org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
 //        implementation ("org.eclipse.paho:org.eclipse.paho.android.service:1.1.1")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.0")
