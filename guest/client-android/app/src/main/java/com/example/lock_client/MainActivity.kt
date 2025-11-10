@@ -4,18 +4,27 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -42,50 +51,46 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.*
 import kotlinx.coroutines.NonCancellable.isActive
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
-import org.eclipse.paho.client.mqttv3.*
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.json.JSONObject
-import java.time.Instant
 import java.util.Base64
+import java.util.UUID
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.min
 
-
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
-
 private val LOCK_ID_KEY = stringPreferencesKey("lock_id")
-private val PHONE_MAC_KEY = stringPreferencesKey("phone_mac")
-private val MQTT_BROKER_KEY = stringPreferencesKey("mqtt_broker")
+private val ISSUER_BEACON_NAME_KEY = stringPreferencesKey("issuer_beacon_name")
+private val ISSUER_BEACON_ADDRESS_KEY = stringPreferencesKey("issuer_beacon_address")
 private val ADVERT_INTERVAL_KEY = stringPreferencesKey("advert_interval")
 
-
 private const val MANUFACTURER_ID = 0xFFFF
-private const val SERVICE_UUID = "0000180D-0000-1000-8000-00805F9B34FB" // 180D
+private const val SERVICE_UUID = "0000180D-0000-1000-8000-00805F9B34FB"
+private const val PROVISIONING_SERVICE_UUID = "c0de0001-0000-1000-8000-00805f9b34fb"
+private const val PROVISIONING_CHARACTERISTIC_UUID = "c0de0002-0000-1000-8000-00805f9b34fb"
 private const val TAG = "BleAdvertiser"
-
 
 class AdvertiserViewModel(application: Application) : AndroidViewModel(application) {
 
     private val dataStore = application.dataStore
-
     private val _uiState = MutableStateFlow(AdvertiserUiState())
     val uiState = _uiState.asStateFlow()
 
-
     private var advertiserJob: Job? = null
     private var bleAdvertiser: BluetoothLeAdvertiser? = null
+    private var bleScanner: BluetoothLeScanner? = null
     private var sessionKey: ByteArray? = null
     private var sessionExpiry: Long = 0L
-
+    private var nonce: String? = null
 
     init {
         log("ViewModel initializing...")
@@ -94,8 +99,8 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             _uiState.update {
                 it.copy(
                     lockId = savedConfig.lockId,
-                    phoneMac = savedConfig.phoneMac,
-                    mqttBroker = savedConfig.mqttBroker,
+                    issuerBeaconName = savedConfig.issuerBeaconName,
+                    issuerBeaconAddress = savedConfig.issuerBeaconAddress,
                     advertInterval = savedConfig.advertInterval
                 )
             }
@@ -106,10 +111,10 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
     private suspend fun loadConfig(): SavedConfig {
         return dataStore.data.map { prefs ->
             SavedConfig(
-                lockId = prefs[LOCK_ID_KEY] ?: "lock_02", // Default value
-                phoneMac = prefs[PHONE_MAC_KEY] ?: "9C:2F:9D:65:CA:A6",
-                mqttBroker = prefs[MQTT_BROKER_KEY] ?: "10.0.7.42",
-                advertInterval = prefs[ADVERT_INTERVAL_KEY]?.toLongOrNull() ?: 30L
+                lockId = prefs[LOCK_ID_KEY] ?: "lock_02",
+                issuerBeaconName = prefs[ISSUER_BEACON_NAME_KEY] ?: "IssuerBeacon",
+                issuerBeaconAddress = prefs[ISSUER_BEACON_ADDRESS_KEY] ?: "",
+                advertInterval = prefs[ADVERT_INTERVAL_KEY]?.toLongOrNull() ?: 5L
             )
         }.first()
     }
@@ -127,18 +132,17 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
 
     fun onSaveConfig(
         lockId: String,
-        phoneMac: String,
-        mqttBroker: String,
+        issuerBeaconName: String,
+        issuerBeaconAddress: String,
         advertInterval: String
     ) {
         val interval = advertInterval.toLongOrNull() ?: uiState.value.advertInterval
 
-
         viewModelScope.launch(Dispatchers.IO) {
             dataStore.edit { prefs ->
                 prefs[LOCK_ID_KEY] = lockId
-                prefs[PHONE_MAC_KEY] = phoneMac
-                prefs[MQTT_BROKER_KEY] = mqttBroker
+                prefs[ISSUER_BEACON_NAME_KEY] = issuerBeaconName
+                prefs[ISSUER_BEACON_ADDRESS_KEY] = issuerBeaconAddress
                 prefs[ADVERT_INTERVAL_KEY] = interval.toString()
             }
         }
@@ -146,8 +150,8 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 lockId = lockId,
-                phoneMac = phoneMac,
-                mqttBroker = mqttBroker,
+                issuerBeaconName = issuerBeaconName,
+                issuerBeaconAddress = issuerBeaconAddress,
                 advertInterval = interval
             )
         }
@@ -155,21 +159,23 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun getSessionKey(context: Context) {
-
-        viewModelScope.launch(Dispatchers.IO) { // Already on a background thread
+        viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(isGettingKey = true, hasSessionKey = false) }
-            log("Requesting session key...")
+            log("Scanning for issuer beacon...")
 
             val config = uiState.value
 
             try {
-
-                val (key, expiry) = fetchKeyViaMqtt(config)
+                val (key, expiry, nonce) = scanAndProvision(context, config)
 
                 sessionKey = key
                 sessionExpiry = expiry
+                this@AdvertiserViewModel.nonce = nonce
                 log("Session key received. Expires: $expiry")
                 log("Key (Base64): ${Base64.getEncoder().encodeToString(key)}")
+                if (nonce != null) {
+                    log("Nonce: $nonce")
+                }
                 _uiState.update { it.copy(hasSessionKey = true) }
 
             } catch (e: Exception) {
@@ -181,97 +187,288 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 _uiState.update { it.copy(hasSessionKey = false) }
             } finally {
-                // This block executes on success, failure, or cancellation
-                log("[MQTT] getSessionKey job finished.")
+                log("getSessionKey job finished.")
                 _uiState.update { it.copy(isGettingKey = false) }
             }
         }
     }
 
-    private suspend fun fetchKeyViaMqtt(
+    @SuppressLint("MissingPermission")
+    private suspend fun scanAndProvision(
+        context: Context,
         config: AdvertiserUiState
-    ): Pair<ByteArray, Long> = withTimeout(10_000L) { // 10-second timeout
+    ): Triple<ByteArray, Long, String?> = withTimeout(30_000L) {
         suspendCancellableCoroutine { continuation ->
-            var client: MqttClient? = null
-            try {
-                val clientId = MqttClient.generateClientId()
-                val serverUri = "tcp://${config.mqttBroker}:1883"
-                val guestTopic = "guests/${config.lockId}/session"
-                val requestTopic = "backend/session_requests"
-                val requestPayload = JSONObject().apply {
-                    put("lock_id", config.lockId)
-                    put("curr_time", Instant.now().epochSecond)
-                }.toString()
+            val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            bleScanner = btManager.adapter.bluetoothLeScanner
 
+            if (bleScanner == null) {
+                continuation.resumeWithException(Exception("BLE Scanner not available"))
+                return@suspendCancellableCoroutine
+            }
 
-                client = MqttClient(serverUri, clientId, MemoryPersistence())
+            val scanCallback = object : ScanCallback() {
+                override fun onScanResult(callbackType: Int, result: ScanResult?) {
+                    result?.let { scanResult ->
+                        val device = scanResult.device
+                        val scanRecord = scanResult.scanRecord
 
-                client.setCallback(object : MqttCallback {
-                    override fun connectionLost(cause: Throwable?) {
-                        log("[MQTT] Connection lost: ${cause?.message}")
-                        if (continuation.isActive)
-                            continuation.resumeWithException(cause ?: Exception("MQTT Connection Lost"))
-                    }
+                        // Check if this matches our issuer beacon
+                        val nameMatch = if (config.issuerBeaconName.isNotEmpty()) {
+                            device.name == config.issuerBeaconName || 
+                            scanRecord?.deviceName == config.issuerBeaconName
+                        } else false
 
-                    override fun messageArrived(topic: String?, message: MqttMessage?) {
-                        if (topic == guestTopic && message != null) {
-                            log("[MQTT] Received session key data.")
-                            try {
-                                val data = JSONObject(message.payload.decodeToString())
-                                val keyB64 = data.getString("session_key")
-                                val expiry = data.optLong("expiry", 0L)
-                                val keyBytes = Base64.getDecoder().decode(keyB64)
+                        val addressMatch = if (config.issuerBeaconAddress.isNotEmpty()) {
+                            device.address.equals(config.issuerBeaconAddress, ignoreCase = true)
+                        } else false
 
+                        val manufacturerMatch = scanRecord?.manufacturerSpecificData?.get(MANUFACTURER_ID) != null
 
-                                if (continuation.isActive)
-                                    continuation.resume(keyBytes to expiry)
-                            } catch (e: Exception) {
-                                if (continuation.isActive)
-                                    continuation.resumeWithException(Exception("Failed to parse key", e))
+                        if (nameMatch || addressMatch || manufacturerMatch) {
+                            log("Found issuer beacon: ${device.name ?: "unknown"} (${device.address})")
+                            bleScanner?.stopScan(this)
+
+                            // Connect and provision
+                            viewModelScope.launch(Dispatchers.IO) {
+                                try {
+                                    val result = connectAndProvision(context, device, config.lockId)
+                                    if (continuation.isActive) {
+                                        continuation.resume(result)
+                                    }
+                                } catch (e: Exception) {
+                                    if (continuation.isActive) {
+                                        continuation.resumeWithException(e)
+                                    }
+                                }
                             }
                         }
                     }
+                }
 
-                    override fun deliveryComplete(token: IMqttDeliveryToken?) {}
-                })
-
-
-                val options = MqttConnectOptions()
-                options.isCleanSession = true
-                log("[MQTT] Connecting to $serverUri...")
-                client.connect(options)
-                log("[MQTT] Connected.")
-
-                log("[MQTT] Subscribing to $guestTopic...")
-                client.subscribe(guestTopic, 1)
-                log("[MQTT] Subscribed.")
-
-                val msg = MqttMessage(requestPayload.toByteArray())
-                msg.qos = 1
-                log("[MQTT] Publishing to $requestTopic...")
-                client.publish(requestTopic, msg)
-                log("[MQTT] Published. Waiting for key...")
-
-            } catch (e: Exception) {
-                if (continuation.isActive)
-                    continuation.resumeWithException(e)
+                override fun onScanFailed(errorCode: Int) {
+                    log("Scan failed with error: $errorCode")
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(Exception("BLE scan failed: $errorCode"))
+                    }
+                }
             }
 
+            val scanSettings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build()
+
+            val filters = mutableListOf<ScanFilter>()
+            
+            // Add manufacturer data filter
+            filters.add(
+                ScanFilter.Builder()
+                    .setManufacturerData(MANUFACTURER_ID, ByteArray(0))
+                    .build()
+            )
+
+            try {
+                log("Starting BLE scan...")
+                bleScanner?.startScan(filters, scanSettings, scanCallback)
+            } catch (e: Exception) {
+                continuation.resumeWithException(Exception("Failed to start scan: ${e.message}"))
+                return@suspendCancellableCoroutine
+            }
 
             continuation.invokeOnCancellation {
                 viewModelScope.launch(Dispatchers.IO) {
                     try {
-                        log("[MQTT] Cleaning up and disconnecting...")
-                        client?.disconnect()
+                        log("Stopping BLE scan...")
+                        bleScanner?.stopScan(scanCallback)
                     } catch (e: Exception) {
-                        log("[MQTT] Error during disconnect: ${e.message}")
+                        log("Error stopping scan: ${e.message}")
                     }
                 }
             }
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private suspend fun connectAndProvision(
+        context: Context,
+        device: android.bluetooth.BluetoothDevice,
+        lockId: String
+    ): Triple<ByteArray, Long, String?> = suspendCancellableCoroutine { continuation ->
+        val responseChannel = Channel<ByteArray>(Channel.CONFLATED)
+        var gatt: BluetoothGatt? = null
 
+        val gattCallback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+                when (newState) {
+                    BluetoothProfile.STATE_CONNECTED -> {
+                        log("Connected to issuer beacon, discovering services...")
+                        gatt?.discoverServices()
+                    }
+                    BluetoothProfile.STATE_DISCONNECTED -> {
+                        log("Disconnected from issuer beacon")
+                    }
+                }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    log("Services discovered")
+                    val service = gatt?.getService(UUID.fromString(PROVISIONING_SERVICE_UUID))
+                    val characteristic = service?.getCharacteristic(
+                        UUID.fromString(PROVISIONING_CHARACTERISTIC_UUID)
+                    )
+
+                    if (characteristic != null) {
+                        // Enable notifications
+                        gatt?.setCharacteristicNotification(characteristic, true)
+                        
+                        // Write descriptor to enable notifications
+                        val descriptor = characteristic.getDescriptor(
+                            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+                        )
+                        descriptor?.let {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gatt?.writeDescriptor(it, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                it.value = BluetoothGattDescriptor
+                                    .ENABLE_NOTIFICATION_VALUE
+                                @Suppress("DEPRECATION")
+                                gatt?.writeDescriptor(it)
+                            }
+                        }
+
+                        // Send provisioning request
+                        viewModelScope.launch {
+                            delay(500) // Give time for notifications to be enabled
+                            
+                            val request = JSONObject().apply {
+                                put("lock_id", lockId)
+                                put("client_time", System.currentTimeMillis() / 1000)
+                            }
+                            val requestBytes = request.toString().toByteArray()
+
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gatt?.writeCharacteristic(
+                                    characteristic,
+                                    requestBytes,
+                                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                characteristic.value = requestBytes
+                                @Suppress("DEPRECATION")
+                                gatt?.writeCharacteristic(characteristic)
+                            }
+                            log("Sent provisioning request")
+                        }
+                    } else {
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(
+                                Exception("Provisioning characteristic not found")
+                            )
+                        }
+                        gatt?.disconnect()
+                    }
+                } else {365
+
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(
+                            Exception("Service discovery failed: $status")
+                        )
+                    }
+                    gatt?.disconnect()
+                }
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt?,
+                characteristic: BluetoothGattCharacteristic?
+            ) {
+                characteristic?.value?.let { data ->
+                    viewModelScope.launch {
+                        responseChannel.send(data)
+                    }
+                }
+            }
+
+//            @Deprecated("Deprecated in API 33")
+//            override fun onCharacteristicChanged(
+//                gatt: BluetoothGatt?,
+//                characteristic: BluetoothGattCharacteristic?,
+//                value: ByteArray
+//            ) {
+//                viewModelScope.launch {
+//                    responseChannel.send(value)
+//                }
+//            }
+        }
+
+        try {
+            log("Connecting to issuer beacon...")
+            gatt = device.connectGatt(context, false, gattCallback)
+
+            // Wait for response with timeout
+            viewModelScope.launch {
+                try {
+                    withTimeout(15_000L) {
+                        val responseData = responseChannel.receive()
+                        val response = JSONObject(String(responseData))
+
+                        if (response.optString("status") == "ok") {
+                            val keyB64 = response.getString("session_key")
+                            val key = Base64.getDecoder().decode(keyB64)
+                            val expiry = response.optLong("expiry", 0L)
+                            val nonce = response.optString("nonce", null)
+                            
+                            val clockOffset = response.optInt("clock_offset", 0)
+                            if (clockOffset != 0) {
+                                log("Issuer reported clock offset: $clockOffset")
+                            }
+
+                            if (continuation.isActive) {
+                                continuation.resume(Triple(key, expiry, nonce))
+                            }
+                        } else {
+                            val errorMsg = response.optString("message", "Unknown error")
+                            if (continuation.isActive) {
+                                continuation.resumeWithException(Exception("Provisioning failed: $errorMsg"))
+                            }
+                        }
+                        
+                        gatt?.disconnect()
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(Exception("Timeout waiting for provisioning response"))
+                    }
+                    gatt?.disconnect()
+                } catch (e: Exception) {
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(e)
+                    }
+                    gatt?.disconnect()
+                }
+            }
+
+        } catch (e: Exception) {
+            if (continuation.isActive) {
+                continuation.resumeWithException(Exception("Failed to connect: ${e.message}"))
+            }
+        }
+
+        continuation.invokeOnCancellation {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    log("Disconnecting from issuer beacon...")
+                    gatt?.disconnect()
+                    gatt?.close()
+                } catch (e: Exception) {
+                    log("Error during disconnect: ${e.message}")
+                }
+            }
+        }
+    }
 
     fun startAdvertisingLoop(context: Context) {
         if (uiState.value.isAdvertising) {
@@ -292,19 +489,18 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
 
         advertiserJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                // advertisingLoop is a suspend function
                 advertisingLoopInternal(context, uiState.value)
             } catch (e: CancellationException) {
                 log("Advertising stopped by user.")
             } catch (e: Exception) {
                 log("Advertising loop error: ${e.message}")
             } finally {
-                // This finally block cleans up the advertising *loop*
                 log("Cleaning up advertising...")
                 stopBleAdvertising()
                 _uiState.update { it.copy(isAdvertising = false, hasSessionKey = false) }
-                sessionKey = null // Invalidate key on stop
+                sessionKey = null
                 sessionExpiry = 0L
+                nonce = null
             }
         }
     }
@@ -330,7 +526,7 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
                 break
             }
 
-            val token = generateToken(config.phoneMac, config.advertInterval)
+            val token = generateToken(config.advertInterval)
             log("[ADV] Updating token: ${token.toHex()}")
 
             stopBleAdvertising()
@@ -346,15 +542,20 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
             delay(sleepTime)
         }
     }
-    
-    private fun generateToken(phoneMac: String, advertInterval: Long): ByteArray {
+
+    private fun generateToken(advertInterval: Long): ByteArray {
         val key = sessionKey ?: throw IllegalStateException("Session key is null")
         val ts = (System.currentTimeMillis() / 1000L) / advertInterval
-        val msg = (phoneMac + ts).toByteArray(Charsets.UTF_8)
+        
+        val components = mutableListOf<ByteArray>()
+        nonce?.let { components.add(it.toByteArray(Charsets.UTF_8)) }
+        components.add(ts.toString().toByteArray(Charsets.UTF_8))
+        
+        val msg = components.reduce { acc, bytes -> acc + bytes }
 
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(key, "HmacSHA256"))
-        return mac.doFinal(msg).copyOfRange(0, 16) // Truncate to 16 bytes
+        return mac.doFinal(msg).copyOfRange(0, 16)
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -363,7 +564,6 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         }
         override fun onStartFailure(errorCode: Int) {
             log("[BLE] Advertising failed to start: ${bleErrorToString(errorCode)}")
-
             stopAdvertisingLoop()
         }
     }
@@ -413,28 +613,23 @@ class AdvertiserViewModel(application: Application) : AndroidViewModel(applicati
         joinToString(separator = "") { eachByte -> "%02x".format(eachByte) }
 }
 
-
 data class AdvertiserUiState(
-    // Config
     val lockId: String = "loading...",
-    val phoneMac: String = "loading...",
-    val mqttBroker: String = "loading...",
-    val advertInterval: Long = 30,
-    // Activity State
+    val issuerBeaconName: String = "loading...",
+    val issuerBeaconAddress: String = "loading...",
+    val advertInterval: Long = 5,
     val isGettingKey: Boolean = false,
     val isAdvertising: Boolean = false,
     val hasSessionKey: Boolean = false,
-    // Logs
     val logs: List<String> = emptyList()
 )
 
 private data class SavedConfig(
     val lockId: String,
-    val phoneMac: String,
-    val mqttBroker: String,
+    val issuerBeaconName: String,
+    val issuerBeaconAddress: String,
     val advertInterval: Long
 )
-
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -449,7 +644,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-
 @Composable
 fun PermissionGatedScreen() {
     var hasPermissions by remember { mutableStateOf(false) }
@@ -459,6 +653,8 @@ fun PermissionGatedScreen() {
         listOf(
             Manifest.permission.BLUETOOTH_ADVERTISE,
             Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.ACCESS_FINE_LOCATION
         )
     } else {
         listOf(
@@ -484,7 +680,6 @@ fun PermissionGatedScreen() {
     }
 
     if (hasPermissions) {
-
         BleAdvertiserScreen(
             viewModel = viewModel(
                 factory = AdvertiserViewModelFactory(
@@ -520,7 +715,6 @@ fun PermissionGatedScreen() {
     }
 }
 
-
 class AdvertiserViewModelFactory(private val application: Application) :
     ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -540,8 +734,8 @@ fun RationaleDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
                 Text("Permissions Required", style = MaterialTheme.typography.titleLarge)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "This app requires Bluetooth permissions to advertise. " +
-                            "On older Android versions, Location is also required for BLE."
+                    "This app requires Bluetooth permissions to scan for and communicate " +
+                            "with the issuer beacon, and to advertise your unlock token."
                 )
                 Spacer(Modifier.height(16.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -553,7 +747,6 @@ fun RationaleDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
         }
     }
 }
-
 
 @Composable
 fun BleAdvertiserScreen(viewModel: AdvertiserViewModel) {
@@ -572,18 +765,16 @@ fun BleAdvertiserScreen(viewModel: AdvertiserViewModel) {
             .fillMaxSize()
             .padding(16.dp)
     ) {
-
         ConfigEditor(
             uiState = uiState,
-            onSave = { lockId, mac, broker, interval ->
-                viewModel.onSaveConfig(lockId, mac, broker, interval)
+            onSave = { lockId, beaconName, beaconAddr, interval ->
+                viewModel.onSaveConfig(lockId, beaconName, beaconAddr, interval)
             }
         )
 
         Spacer(Modifier.height(16.dp))
         Divider()
         Spacer(Modifier.height(16.dp))
-
 
         ControlPanel(
             uiState = uiState,
@@ -619,17 +810,18 @@ fun BleAdvertiserScreen(viewModel: AdvertiserViewModel) {
     }
 }
 
-
 @Composable
 fun ConfigEditor(
     uiState: AdvertiserUiState,
     onSave: (String, String, String, String) -> Unit
 ) {
-
-
     var draftLockId by remember(uiState.lockId) { mutableStateOf(uiState.lockId) }
-    var draftPhoneMac by remember(uiState.phoneMac) { mutableStateOf(uiState.phoneMac) }
-    var draftMqttBroker by remember(uiState.mqttBroker) { mutableStateOf(uiState.mqttBroker) }
+    var draftBeaconName by remember(uiState.issuerBeaconName) { 
+        mutableStateOf(uiState.issuerBeaconName) 
+    }
+    var draftBeaconAddress by remember(uiState.issuerBeaconAddress) { 
+        mutableStateOf(uiState.issuerBeaconAddress) 
+    }
     var draftAdvertInterval by remember(uiState.advertInterval) {
         mutableStateOf(uiState.advertInterval.toString())
     }
@@ -637,7 +829,7 @@ fun ConfigEditor(
     val isEnabled = !uiState.isAdvertising && !uiState.isGettingKey
 
     Column {
-        Text("Configuration", style = MaterialTheme. typography.headlineSmall)
+        Text("Configuration", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(8.dp))
 
         ConfigTextField(
@@ -647,15 +839,15 @@ fun ConfigEditor(
             enabled = isEnabled
         )
         ConfigTextField(
-            label = "Phone MAC",
-            value = draftPhoneMac,
-            onValueChange = { draftPhoneMac = it },
+            label = "Issuer Beacon Name",
+            value = draftBeaconName,
+            onValueChange = { draftBeaconName = it },
             enabled = isEnabled
         )
         ConfigTextField(
-            label = "MQTT Broker (IP or Hostname)",
-            value = draftMqttBroker,
-            onValueChange = { draftMqttBroker = it },
+            label = "Issuer Beacon Address (optional)",
+            value = draftBeaconAddress,
+            onValueChange = { draftBeaconAddress = it },
             enabled = isEnabled
         )
         ConfigTextField(
@@ -666,7 +858,9 @@ fun ConfigEditor(
         )
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = { onSave(draftLockId, draftPhoneMac, draftMqttBroker, draftAdvertInterval) },
+            onClick = { 
+                onSave(draftLockId, draftBeaconName, draftBeaconAddress, draftAdvertInterval) 
+            },
             enabled = isEnabled,
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -674,7 +868,6 @@ fun ConfigEditor(
         }
     }
 }
-
 
 @Composable
 fun ControlPanel(
@@ -690,7 +883,6 @@ fun ControlPanel(
         horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically
     ) {
-
         Box(contentAlignment = Alignment.Center) {
             Button(
                 onClick = onGetKey,
@@ -702,7 +894,6 @@ fun ControlPanel(
                 CircularProgressIndicator(modifier = Modifier.size(24.dp))
             }
         }
-
 
         Button(
             onClick = onStart,
@@ -722,7 +913,6 @@ fun ControlPanel(
         }
     }
 }
-
 
 @Composable
 fun ConfigTextField(
