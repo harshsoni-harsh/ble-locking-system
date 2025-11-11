@@ -1,103 +1,163 @@
 # BLE Locking System
 
 ## Overview
-This project prototypes a secure BLE locking system where phones obtain short-lived unlock credentials over Bluetooth Low Energy and present rolling advertisements that locks can verify. A backend service issues the credentials, advertises itself as a provisioning beacon, and pushes encrypted session material to locks over MQTT so they can validate guest beacons.
+A secure BLE locking system where phones obtain short-lived unlock credentials over Bluetooth and present rolling HMAC tokens that locks can verify. The backend issues credentials via BLE GATT, advertises as a provisioning beacon, and distributes encrypted sessions to locks via MQTT.
 
-The repository contains three runnable roles plus supporting utilities:
+**Three main components:**
 
-- **Backend issuer** (`backend/issuer.py`): Advertises a BLE provisioning service and issues session keys.
-- **Guest unlocker** (`guest/unlocker.py`): Scans for the issuer beacon, provisions a session over GATT, and advertises rolling tokens.
-- **Lock scanners** (`lock/lock.py` and `lock/multi_user_lock.py`): Subscribe to encrypted sessions via MQTT and verify BLE advertisements from provisioned phones.
-
-## Architecture
+- **Issuer** (`backend/issuer.py`): BLE beacon that provisions sessions and distributes them to locks via MQTT
+- **Unlocker** (`guest/unlocker.py`): Guest phone that requests sessions and advertises rolling HMAC tokens
+- **Lock** (`lock/lock.py`): Subscribes to MQTT for sessions and validates BLE advertisements to unlock
 
 ## Architecture
 
-### Backend (`backend/issuer.py`)
-- Hosts an always-on BLE advertisement so guests can discover the provisioning beacon.
-- **Note**: Backend public key is now pre-distributed to guests (not transmitted via BLE). See [HARDCODED_KEY.md](HARDCODED_KEY.md) for details.
-- Exposes a GATT characteristic; guests write a JSON request containing `lock_id` (and optionally time/MAC).
-- Issues a fresh 32-byte session key, encrypts and signs a payload for the lock, and publishes it to `locks/{lock_id}/session` via MQTT.
-- Returns the plaintext session key, expiry, nonce, and optional clock offset to the guest over the notification channel.
-- Resolves the guest's Bluetooth MAC through D-Bus when available so locks can bind sessions to devices.
+### Issuer (`backend/issuer.py`)
+- Advertises as a BLE beacon for discovery by guest phones
+- Exposes GATT characteristic for session provisioning requests
+- Generates 32-byte session keys with expiry timestamps and nonces
+- Encrypts sessions with RSA-OAEP (using lock's public key) and publishes to MQTT topic `locks/{lock_id}/session`
+- Returns encrypted session payload to guest (using guest's public key from request)
+- Signs all payloads with RSA-PSS for authenticity
 
-### Guest (`guest/unlocker.py`)
-- **Note**: Loads backend public key from `keys/backend_public.pem` at startup for request encryption and signature verification.
-- Scans continuously until it discovers the issuer beacon (matching by address, name, or manufacturer data).
-- Connects to the provisioning characteristic, writes a request, and waits for the session response.
-- Generates time-based HMAC tokens (rolling every `ADVERT_INTERVAL` seconds) and advertises them in manufacturer data (company ID `0xFFFF`).
-- Refreshes the advertisement payload periodically until the server-declared expiry is reached.
+### Unlocker (`guest/unlocker.py`)
+- Scans for issuer beacon and connects via BLE GATT
+- Sends plaintext request: `{lock_id, client_id, unlocker_public_key}`
+- Receives and decrypts session payload using RSA private key
+- Generates rolling HMAC-SHA256 tokens every 3 seconds: `HMAC(session_key, nonce||timestamp)`
+- Advertises tokens via BLE manufacturer data (company ID `0xFFFF`, 16-byte token)
+- Token rotation: every 3s, BLE advertisement: every 100-200ms
 
 ### Lock (`lock/lock.py`)
-- Subscribes to `locks/{lock_id}/session`, decrypts the RSA-encrypted session key, and caches the active session.
-- Uses `bleak` to scan for advertisements containing the expected manufacturer data.
-- Checks RSSI thresholds, optional phone MAC binding, session expiry, and HMAC validity before reporting an unlock event.
-
-### Multi-User Lock (`lock/multi_user_lock.py`)
-- Variation that manages multiple simultaneous sessions keyed by phone MAC addresses.
-- Allows per-phone RSSI thresholds via the `AUTHORIZED_PHONES` dictionary.
+- Subscribes to MQTT topic `locks/{lock_id}/session`
+- Decrypts incoming sessions with RSA private key and verifies backend signature
+- Scans for BLE advertisements containing manufacturer data
+- Validates HMAC tokens against active session(s)
+- Unlocks when: token matches + RSSI > -70 dBm + session not expired
+- Automatically cleans up expired sessions
 
 ## Security Features
-- **RSA-OAEP + RSA-PSS** protect and authenticate session payloads sent toward locks.
-- **HMAC-SHA256** rolling tokens with nonce + time resist replay attacks.
-- **Short-lived sessions** (default 5 minutes) limit exposure.
-- **Optional MAC binding** lets the backend tie sessions to the phone that provisioned them.
+- **RSA-2048 encryption**: Session payloads encrypted separately for lock and unlocker
+- **RSA-PSS signatures**: All payloads signed by backend for authenticity verification
+- **HMAC-SHA256 tokens**: Rolling tokens with nonce + timestamp resist replay attacks
+- **Short-lived sessions**: Default 5-minute expiry limits credential lifetime
+- **Field-specific encryption**: Only sensitive session data is encrypted (no double-encryption overhead)
+- **RSSI proximity check**: Lock only accepts advertisements with signal strength > -70 dBm
+
+## Flow Diagrams
+
+### Session Provisioning
+```mermaid
+sequenceDiagram
+    participant Unlocker
+    participant Issuer
+    participant Lock
+    
+    Unlocker->>Issuer: [1] BLE Scan
+    Issuer-->>Unlocker: Advertisement
+    
+    Unlocker->>Issuer: [2] GATT Connect
+    
+    Unlocker->>Issuer: [3] Write Request<br/>{lock_id, unlocker_pub_key}
+    
+    Note over Issuer: [4] Generate Session<br/>(key, nonce, expiry)
+    
+    Issuer->>Lock: [5] MQTT Publish<br/>(encrypted for lock)
+    
+    Note over Lock: [6] Decrypt & Store
+    
+    Issuer-->>Unlocker: [7] Notify Response<br/>{payload: encrypted, signature}
+    
+    Note over Unlocker: [8] Decrypt<br/>-> session_key, nonce, expiry
+```
+
+### Lock Unlock
+```mermaid
+sequenceDiagram
+    participant U as Unlocker
+    participant L as Lock
+    
+    Note over U: [1] Generate Token (every 3s)<br/>HMAC(key, nonce||timestamp)[:16]
+    
+    loop Every 100-200ms
+        U->>L: [2] BLE Advertise<br/>Mfr Data: {0xFFFF: token}
+    end
+    
+    Note over L: [3] Scan & Detect
+    
+    Note over L: [4] Validate<br/>- Check RSSI<br/>- Verify HMAC<br/>- Check expiry
+    
+    L-->>U: [5] UNLOCK!
+```
+
+
 
 ## Prerequisites
-- Linux host with BLE adapter and BlueZ (version supporting LE Peripheral).
-- Python 3.10+ (tested with 3.13 on Ubuntu).
-- An MQTT broker (Mosquitto works well).
+- Linux with BLE adapter and BlueZ (with LE Peripheral support)
+- Python 3.10+
+- MQTT broker (e.g., Mosquitto)
 
 ## Installation
-1. Clone and install requirements:
-   ```bash
-   git clone https://github.com/harshsoni-harsh/ble-locking-system.git
-   cd ble-locking-system
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-2. Ensure the broker is running and reachable. For local testing:
-   ```bash
-   sudo apt install mosquitto
-   sudo systemctl enable --now mosquitto
-   ```
-3. Confirm RSA key material exists in `keys/`. Generate replacements as needed (2048-bit minimum) for backend and each lock ID.
+```bash
+git clone https://github.com/harshsoni-harsh/ble-locking-system.git
+cd ble-locking-system
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-## End-to-End Flow
-1. **Start backend issuer**:
-   ```bash
-   python backend/issuer.py
-   ```
-   Logs should note the advertising adapter and provisioning service registration.
-2. **Start lock** on the device near the door:
-   ```bash
-   python lock/lock.py
-   ```
-   It subscribes to the MQTT session topic and begins scanning.
-3. **Run guest unlocker** (phone simulator):
-   ```bash
-   python guest/unlocker.py
-   ```
-   The guest discovers the issuer beacon, negotiates a session, and starts advertising tokens.
-4. The lock receives the encrypted session from MQTT, validates advertisements, and logs successful unlocks when tokens match.
+Start MQTT broker:
+```bash
+sudo apt install mosquitto
+sudo systemctl enable --now mosquitto
+```
 
-For multi-user setups, run `python lock/multi_user_lock.py` instead and populate `AUTHORIZED_PHONES` with allowed MAC addresses and thresholds.
+Generate RSA keys (2048-bit minimum):
+- `keys/backend_private.pem` / `backend_public.pem` (issuer)
+- `keys/lock_01_private.pem` / `lock_01_public.pem` (per lock)
+- `keys/unlocker_private.pem` / `unlocker_public.pem` (per guest)
 
-## Testing Tips
-- Use `bluetoothctl show` and `bluetoothctl scan on` to confirm adapters are powered and visible.
-- `sudo btmon` is helpful to inspect raw BLE traffic when debugging advertisement payloads.
-- If the guest cannot register its advert, check BlueZ experimental mode and ensure payload size ≤ 31 bytes.
-- When provisioning fails, verify the provisioning characteristic UUIDs match between backend and guest.
+## Usage
+
+**1. Start Issuer:**
+```bash
+python -m backend.issuer
+```
+
+**2. Start Lock:**
+```bash
+python -m lock.lock
+```
+
+**3. Start Unlocker (guest phone simulator):**
+```bash
+python -m guest.unlocker
+```
+
+The lock will log unlock events when valid tokens are detected.
+
+## Configuration
+
+Key environment variables:
+- `LOCK_ID`: Target lock identifier (default: `lock_01`)
+- `CLIENT_ID`: Guest client identifier (default: `default`)
+- `MQTT_BROKER`: MQTT broker address (default: `localhost`)
+- `ISSUER_BEACON_ADDRESS`: Issuer BLE MAC address (optional, for faster discovery)
+- `ADVERT_INTERVAL`: Token rotation interval in seconds (default: `3`)
+
+## Debugging Tools
+- `bluetoothctl`: Check adapter status and scan for devices
+- `sudo btmon`: Monitor raw BLE traffic and advertisement payloads
+- `mosquitto_sub -t 'locks/#'`: Monitor MQTT session distribution
 
 ## Troubleshooting
-- **MQTT timeouts**: confirm broker reachability, check credentials/firewall, and verify `MQTT_BROKER` values.
-- **BLE scan finds no issuer**: confirm backend advert is live (`sudo btmon`), adjust `ISSUER_SCAN_TIMEOUT`, or supply the beacon’s MAC via `ISSUER_BEACON_ADDRESS`.
-- **Provisioning GATT write errors**: BlueZ must run with `--experimental`; also ensure only one process is advertising on the adapter.
-- **Clock skew errors**: the backend returns `clock_offset`; use it to adjust token generation logic if needed.
+- **No issuer found**: Verify beacon is advertising (`sudo btmon`), check `ISSUER_BEACON_ADDRESS`
+- **MQTT connection fails**: Confirm broker is running, check firewall/credentials
+- **BLE advertisement errors**: Ensure BlueZ runs with `--experimental`, payload ≤ 31 bytes
+- **GATT write errors**: Only one process can advertise per adapter; check for conflicts
+- **Token validation fails**: Verify clock sync between devices, check `clock_offset` in response
 
 ## Future Improvements
-- Persist sessions and audit logs on the backend.
-- Evaluate distance estimation by embedding calibrated Tx power in adverts.
-- Harden MQTT transport with TLS and credentials.
-
+- Multi platform app implementation (Android/iOS)
+- Session persistence and audit logging
+- TLS for MQTT transport
+- Distance estimation using calibrated Tx power
