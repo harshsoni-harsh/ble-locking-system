@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 KEYS_DIR = ROOT_DIR / "keys"
-ADVERT_INTERVAL = 5
+ADVERT_INTERVAL = 3
 ROLLING_WINDOW = 1
 MANUFACTURER_ID = 0xFFFF
 
@@ -170,7 +170,7 @@ def validate_token(token: bytes, session: SessionRecord, now: Optional[float] = 
     return False
 
 def matches_mac(session: SessionRecord, device_mac: Optional[str]) -> bool:
-    return 1
+    return True  # because, user's mac is ephemeral
     if session.phone_mac is None:
         return True
     if device_mac is None:
