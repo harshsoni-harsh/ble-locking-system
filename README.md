@@ -11,14 +11,18 @@ The repository contains three runnable roles plus supporting utilities:
 
 ## Architecture
 
+## Architecture
+
 ### Backend (`backend/issuer.py`)
 - Hosts an always-on BLE advertisement so guests can discover the provisioning beacon.
+- **Note**: Backend public key is now pre-distributed to guests (not transmitted via BLE). See [HARDCODED_KEY.md](HARDCODED_KEY.md) for details.
 - Exposes a GATT characteristic; guests write a JSON request containing `lock_id` (and optionally time/MAC).
 - Issues a fresh 32-byte session key, encrypts and signs a payload for the lock, and publishes it to `locks/{lock_id}/session` via MQTT.
 - Returns the plaintext session key, expiry, nonce, and optional clock offset to the guest over the notification channel.
-- Resolves the guest’s Bluetooth MAC through D-Bus when available so locks can bind sessions to devices.
+- Resolves the guest's Bluetooth MAC through D-Bus when available so locks can bind sessions to devices.
 
 ### Guest (`guest/unlocker.py`)
+- **Note**: Loads backend public key from `keys/backend_public.pem` at startup for request encryption and signature verification.
 - Scans continuously until it discovers the issuer beacon (matching by address, name, or manufacturer data).
 - Connects to the provisioning characteristic, writes a request, and waits for the session response.
 - Generates time-based HMAC tokens (rolling every `ADVERT_INTERVAL` seconds) and advertises them in manufacturer data (company ID `0xFFFF`).

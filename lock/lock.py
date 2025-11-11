@@ -1,8 +1,15 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
 import logging
+import sys
+from pathlib import Path
 from typing import Optional
+
+if __package__ is None or __package__ == "":  # pragma: no cover - script invocation support
+	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
@@ -70,7 +77,7 @@ def detection_callback(device, advertisement_data):
 	rssi = advertisement_data.rssi
 	logger.debug("RSSI %s, threshold %s", rssi, RSSI_THRESHOLD)
 	if rssi is not None and rssi <= RSSI_THRESHOLD:
-		logger.info("Device %s below RSSI threshold; ignoring", device.address)
+		logger.info("Device %s below RSSI threshold; RSSI=%s; ignoring", device.address, rssi)
 		return
 
 	device_mac = normalize_mac(device.address)
@@ -87,7 +94,7 @@ def detection_callback(device, advertisement_data):
 	else:
 		logger.warning("Invalid token from %s: %s", device_mac, token.hex())
 
-async def main():
+async def main() -> None:
 	client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
 	client.on_message = on_message
 	client.connect(MQTT_BROKER, MQTT_PORT, 60)

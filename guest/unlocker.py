@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -7,12 +8,14 @@ import logging
 import os
 import time
 from contextlib import suppress
-from typing import Any, Dict, Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Optional, cast
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak.exc import BleakError
+from bleak.exc import BleakError, BleakDBusError
 from bluez_peripheral.advert import Advertisement
 from bluez_peripheral.util import Adapter, get_message_bus
 from dbus_next.constants import MessageType, PropertyAccess
@@ -21,16 +24,45 @@ from dbus_next.message import Message
 from dbus_next.signature import Variant
 from dbus_next.service import dbus_property
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.serialization import (
+	Encoding,
+	PublicFormat,
+	load_pem_private_key,
+	load_pem_public_key,
+)
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+KEYS_DIR = Path(os.getenv("KEYS_DIR", str(ROOT_DIR / "keys")))
+UNLOCKER_PRIVATE_KEY_PATH = Path(
+	os.getenv("UNLOCKER_PRIVATE_KEY", str(KEYS_DIR / "unlocker_private.pem"))
+)
+_BACKEND_PUBLIC_KEY_ENV = os.getenv("BACKEND_PUBLIC_KEY")
+_BACKEND_PUBLIC_KEY_DEFAULT = KEYS_DIR / "backend_public.pem"
+if _BACKEND_PUBLIC_KEY_ENV:
+	BACKEND_PUBLIC_KEY_PATH: Optional[Path] = Path(_BACKEND_PUBLIC_KEY_ENV)
+elif _BACKEND_PUBLIC_KEY_DEFAULT.exists():
+	BACKEND_PUBLIC_KEY_PATH = _BACKEND_PUBLIC_KEY_DEFAULT
+else:
+	BACKEND_PUBLIC_KEY_PATH = None
+CLIENT_ID = os.getenv("CLIENT_ID", "default")
+
 LOCK_ID = os.getenv("LOCK_ID", "lock_01")
 MANUFACTURER_ID = 0xFFFF
-ADVERT_INTERVAL = 5
+ADVERT_INTERVAL = 3  # Token update interval in seconds
+BLE_MIN_INTERVAL = int(os.getenv("BLE_MIN_INTERVAL", "100")) # in ms
+BLE_MAX_INTERVAL = int(os.getenv("BLE_MAX_INTERVAL", "200")) # in ms
 ADVERT_TIMEOUT = 0  # Continuous advertising
 ISSUER_BEACON_NAME = os.getenv("ISSUER_BEACON_NAME", "IssuerBeacon")
 ISSUER_BEACON_ADDRESS = os.getenv("ISSUER_BEACON_ADDRESS")
-ISSUER_SCAN_TIMEOUT = float(os.getenv("ISSUER_SCAN_TIMEOUT", "8.0"))
+ISSUER_SCAN_TIMEOUT = float(os.getenv("ISSUER_SCAN_TIMEOUT", "10.0"))
 ISSUER_CONNECT_TIMEOUT = float(os.getenv("ISSUER_CONNECT_TIMEOUT", "10.0"))
 ISSUER_RESPONSE_TIMEOUT = float(os.getenv("ISSUER_RESPONSE_TIMEOUT", "10.0"))
 PROVISIONING_SERVICE_UUID = os.getenv(
@@ -51,6 +83,107 @@ def generate_token(session_key: bytes, nonce: Optional[str]) -> bytes:
 	components.append(str(ts).encode())
 	msg = b"".join(components)
 	return hmac.new(session_key, msg, hashlib.sha256).digest()[:16]
+
+
+@lru_cache()
+def _load_unlocker_private_key() -> rsa.RSAPrivateKey:
+	if not UNLOCKER_PRIVATE_KEY_PATH.exists():
+		raise RuntimeError(
+			f"Unlocker private key not found at {UNLOCKER_PRIVATE_KEY_PATH}"
+		)
+	with open(UNLOCKER_PRIVATE_KEY_PATH, "rb") as handle:
+		return cast(
+			rsa.RSAPrivateKey,
+			load_pem_private_key(handle.read(), password=None, backend=default_backend()),
+		)
+
+@lru_cache()
+def _load_backend_public_key_from_file() -> rsa.RSAPublicKey:
+	"""Load backend public key from file (hardcoded key path)."""
+	path = BACKEND_PUBLIC_KEY_PATH
+	if path is None:
+		raise RuntimeError(
+			"Backend public key path not configured. "
+			"Set BACKEND_PUBLIC_KEY env var or place key at keys/backend_public.pem"
+		)
+	if not path.exists():
+		raise RuntimeError(f"Backend public key not found at {path}")
+	with open(path, "rb") as handle:
+		key = cast(
+			rsa.RSAPublicKey,
+			load_pem_public_key(handle.read(), backend=default_backend()),
+		)
+	logger.info("Loaded backend public key from %s", path)
+	return key
+
+@lru_cache()
+def _load_unlocker_public_key_bytes() -> bytes:
+	private_key = _load_unlocker_private_key()
+	return private_key.public_key().public_bytes(
+		encoding=Encoding.PEM,
+		format=PublicFormat.SubjectPublicKeyInfo,
+	)
+
+def _decrypt_guest_payload(payload_b64: str, signature_b64: Optional[str]) -> Dict[str, Any]:
+	try:
+		encrypted_payload = base64.b64decode(payload_b64)
+	except (binascii.Error, TypeError) as exc:
+		raise RuntimeError("Issuer payload decoding failed") from exc
+
+	private_key = _load_unlocker_private_key()
+	plaintext = private_key.decrypt(
+		encrypted_payload,
+		padding.OAEP(
+			mgf=padding.MGF1(algorithm=hashes.SHA256()),
+			algorithm=hashes.SHA256(),
+			label=None,
+		),
+	)
+
+	if signature_b64:
+		try:
+			signature = base64.b64decode(signature_b64)
+		except (binascii.Error, TypeError) as exc:
+			raise RuntimeError("Issuer signature decoding failed") from exc
+		backend_public = _load_backend_public_key_from_file()
+		try:
+			backend_public.verify(
+				signature,
+				plaintext,
+				padding.PSS(
+					mgf=padding.MGF1(hashes.SHA256()),
+					salt_length=padding.PSS.MAX_LENGTH,
+				),
+				hashes.SHA256(),
+			)
+		except InvalidSignature as exc:
+			raise RuntimeError("Issuer response signature invalid") from exc
+
+	try:
+		return json.loads(plaintext.decode())
+	except json.JSONDecodeError as exc:
+		raise RuntimeError("Issuer response payload malformed") from exc
+
+def _decode_session_response(response: Dict[str, Any]) -> Dict[str, Any]:
+	if response.get("status") != "ok":
+		return response
+
+	payload_b64 = response.get("payload")
+	if not isinstance(payload_b64, str):
+		return response
+
+	signature_b64 = response.get("signature")
+	if signature_b64 is not None and not isinstance(signature_b64, str):
+		signature_b64 = None
+
+	decrypted = _decrypt_guest_payload(payload_b64, signature_b64)
+	result: Dict[str, Any] = {
+		key: value
+		for key, value in response.items()
+		if key not in {"payload", "signature", "encryption"}
+	}
+	result.update(decrypted)
+	return result
 
 async def get_first_adapter(bus) -> Adapter:
 	message = Message(
@@ -74,13 +207,10 @@ async def get_first_adapter(bus) -> Adapter:
 
 	raise ValueError("No bluetooth adapters could be found.")
 
-def _matches_issuer(
-	device: BLEDevice,
-	advertisement: Optional[AdvertisementData] = None,
-) -> bool:
+def _matches_issuer(device: BLEDevice, advertisement: Optional[AdvertisementData] = None) -> bool:
+	"""Check if device matches the issuer beacon by address, name, or manufacturer data."""
 	if ISSUER_BEACON_ADDRESS:
-		address = ISSUER_BEACON_ADDRESS.lower().replace("-", ":")
-		if device.address.lower() == address:
+		if device.address.lower() == ISSUER_BEACON_ADDRESS.lower().replace("-", ":"):
 			return True
 
 	if ISSUER_BEACON_NAME:
@@ -88,20 +218,19 @@ def _matches_issuer(
 		if device.name == ISSUER_BEACON_NAME or adv_name == ISSUER_BEACON_NAME:
 			return True
 
-	manufacturer_data: Optional[Dict[int, bytes]] = None
-	if advertisement is not None:
-		manufacturer_data = advertisement.manufacturer_data or {}
+	manufacturer_data = None
+	if advertisement:
+		manufacturer_data = advertisement.manufacturer_data
 	else:
-		metadata = getattr(device, "metadata", {}) or {}
-		if isinstance(metadata, dict):
+		metadata = getattr(device, "metadata", {})
+		if metadata:
 			manufacturer_data = metadata.get("manufacturer_data")
-	if manufacturer_data and MANUFACTURER_ID in manufacturer_data:
-		return True
+	
+	return bool(manufacturer_data and MANUFACTURER_ID in manufacturer_data)
 
-	return False
-
-
-async def find_issuer_beacon(scan_timeout: float = ISSUER_SCAN_TIMEOUT) -> BLEDevice:
+async def find_issuer_beacon(
+	scan_timeout: float = ISSUER_SCAN_TIMEOUT,
+) -> BLEDevice:
 	"""Scan for the issuer beacon using optional name/address hints."""
 	logger.info("Scanning for issuer beacon (timeout %.1fs)", scan_timeout)
 	found_device: Optional[BLEDevice] = None
@@ -109,10 +238,12 @@ async def find_issuer_beacon(scan_timeout: float = ISSUER_SCAN_TIMEOUT) -> BLEDe
 
 	def detection_callback(device: BLEDevice, advertisement: AdvertisementData) -> None:
 		nonlocal found_device
-		if found_device is not None:
+		if not _matches_issuer(device, advertisement):
 			return
-		if _matches_issuer(device, advertisement):
+		
+		if found_device is None:
 			found_device = device
+			logger.info("Found issuer beacon: %s (%s)", device.name or "unknown", device.address)
 			found_event.set()
 
 	scanner = BleakScanner(detection_callback=detection_callback)
@@ -120,15 +251,17 @@ async def find_issuer_beacon(scan_timeout: float = ISSUER_SCAN_TIMEOUT) -> BLEDe
 		await scanner.start()
 	except BleakError as exc:
 		raise RuntimeError("BLE scan failed for issuer beacon") from exc
-
+	
 	try:
 		# Check already-known devices immediately.
 		for device in list(scanner.discovered_devices):
 			if _matches_issuer(device):
 				found_device = device
+				logger.info("Found issuer beacon: %s (%s)", device.name or "unknown", device.address)
 				found_event.set()
 				break
 
+		# Wait for beacon if not already found
 		if not found_event.is_set():
 			try:
 				await asyncio.wait_for(found_event.wait(), timeout=scan_timeout)
@@ -140,23 +273,105 @@ async def find_issuer_beacon(scan_timeout: float = ISSUER_SCAN_TIMEOUT) -> BLEDe
 
 	if not found_device:
 		raise RuntimeError("Issuer beacon not found during scan")
-	logger.info("Issuer beacon candidate: %s (%s)", found_device.name or "unknown", found_device.address)
+	
+	logger.info(
+		"Issuer beacon found: %s (%s)",
+		found_device.name or "unknown",
+		found_device.address,
+	)
 	return found_device
 
 async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optional[str]]:
+	"""Request a session key from the issuer beacon."""
 	device = await find_issuer_beacon()
+	backend_public_key = _load_backend_public_key_from_file()
 	response_event = asyncio.Event()
 	result: Dict[str, Any] = {}
+	# Buffer for chunked notifications
+	pending_notifications: Dict[str, Any] = {"total": 0, "parts": {}}
 
 	def handle_notification(_: Any, data: bytearray) -> None:
 		nonlocal result
 		if response_event.is_set():
 			return
+		# Try to decode notification as UTF-8 JSON
+		rb = bytes(data)
+		text: Optional[str] = None
 		try:
-			payload = json.loads(bytes(data).decode())
-		except (UnicodeDecodeError, json.JSONDecodeError):
-			logger.error("Received malformed provisioning response from issuer")
+			text = rb.decode()
+			obj = json.loads(text)
+		except Exception:
+			# Not JSON or not UTF8 - log and return
+			logger.error(
+				"Received malformed provisioning response from issuer: not-json (hex=%s, b64=%s)",
+				rb.hex(),
+				base64.b64encode(rb).decode(),
+			)
 			return
+
+		# If this is a chunk object, buffer and assemble
+		if isinstance(obj, dict) and {"chunk_index", "total_chunks", "data"}.issubset(obj.keys()):
+			pending = pending_notifications
+			idx = int(obj["chunk_index"])
+			total = int(obj["total_chunks"])
+			if pending["total"] == 0:
+				pending["total"] = total
+			# Store decoded chunk
+			try:
+				part = base64.b64decode(obj["data"])
+			except (binascii.Error, TypeError):
+				logger.error("Received invalid base64 chunk in notification")
+				return
+			pending["parts"][idx] = part
+			# Check completion
+			if len(pending["parts"]) < pending["total"]:
+				return
+			# Assemble
+			assembled = b"".join(pending["parts"][i] for i in range(pending["total"]))
+			# Reset pending
+			pending_notifications["total"] = 0
+			pending_notifications["parts"] = {}
+			try:
+				payload = json.loads(assembled.decode())
+			except Exception:
+				logger.error("Reassembled provisioning response malformed (hex=%s)", assembled.hex())
+				return
+		else:
+			payload = obj
+		
+		# If issuer sent encrypted response with AES-GCM, decrypt using sym_key
+		if isinstance(payload, dict) and payload.get("encryption", {}).get("algorithm") == "HYBRID":
+			ciphertext_b64 = payload.get("ciphertext")
+			if not ciphertext_b64:
+				logger.error("Missing ciphertext in encrypted response")
+				return
+			try:
+				blob = base64.b64decode(ciphertext_b64)
+			except (binascii.Error, TypeError):
+				logger.error("Invalid base64 ciphertext in response")
+				return
+			if len(blob) < 12:
+				logger.error("Ciphertext too short for AES-GCM nonce")
+				return
+			nonce_resp = blob[:12]
+			ct_resp = blob[12:]
+			# Retrieve the symmetric key we stored when sending request
+			sym_key_stored = getattr(handle_notification, "sym_key", None)
+			if not sym_key_stored:
+				logger.error("No symmetric key available to decrypt response")
+				return
+			aesgcm_dec = AESGCM(sym_key_stored)
+			try:
+				plaintext_resp = aesgcm_dec.decrypt(nonce_resp, ct_resp, associated_data=None)
+			except Exception as exc:
+				logger.error("Failed to decrypt response with symmetric key: %s", exc)
+				return
+			try:
+				payload = json.loads(plaintext_resp.decode())
+			except Exception:
+				logger.error("Decrypted response is not valid JSON")
+				return
+		
 		result = payload
 		response_event.set()
 
@@ -170,16 +385,78 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 				device.address,
 			)
 			await client.start_notify(PROVISIONING_CHARACTERISTIC_UUID, handle_notification)
-			request_payload: Dict[str, Any] = {
+			
+			# Generate symmetric key for response encryption
+			sym_key = AESGCM.generate_key(bit_length=256)
+			encrypted_sym_key = backend_public_key.encrypt(
+				sym_key,
+				padding.OAEP(
+					mgf=padding.MGF1(algorithm=hashes.SHA256()),
+					algorithm=hashes.SHA256(),
+					label=None,
+				),
+			)
+
+			request_plain: Dict[str, Any] = {
 				"lock_id": lock_id,
 				"client_time": int(time.time()),
+				"unlocker_public_key": base64.b64encode(_load_unlocker_public_key_bytes()).decode(),
 			}
-			payload_bytes = json.dumps(request_payload, separators=(",", ":")).encode()
-			await client.write_gatt_char(
-				PROVISIONING_CHARACTERISTIC_UUID,
-				payload_bytes,
-				response=True,
-			)
+			if CLIENT_ID:
+				request_plain["client_id"] = CLIENT_ID
+			
+			encrypted_request = {
+				"request": request_plain,
+				"encrypted_key": base64.b64encode(encrypted_sym_key).decode(),
+				"encryption": {
+					"algorithm": "HYBRID",
+					"symmetric": "AES-GCM",
+				},
+			}
+			# Store sym_key for later response decryption
+			handle_notification.sym_key = sym_key  # type: ignore
+			payload_bytes = json.dumps(encrypted_request, separators=(",", ":")).encode()
+			# BLE GATT writes may have limits; chunk the payload if it's large.
+			DEFAULT_CHUNK = int(os.getenv("PROVISION_CHUNK_SIZE", "120"))
+
+			async def _send_chunks(chunk_size: int) -> None:
+				if len(payload_bytes) <= chunk_size:
+					await client.write_gatt_char(
+						PROVISIONING_CHARACTERISTIC_UUID,
+						payload_bytes,
+						response=True,
+					)
+					return
+				total = (len(payload_bytes) + chunk_size - 1) // chunk_size
+				for idx in range(total):
+					start = idx * chunk_size
+					chunk = payload_bytes[start : start + chunk_size]
+					chunk_obj = {
+						"chunk_index": idx,
+						"total_chunks": total,
+						"data": base64.b64encode(chunk).decode(),
+					}
+					await client.write_gatt_char(
+						PROVISIONING_CHARACTERISTIC_UUID,
+						json.dumps(chunk_obj, separators=(",", ":")).encode(),
+						response=True,
+					)
+					# small delay to avoid overwhelming the BLE stack
+					await asyncio.sleep(0.03)
+
+			# Try sending with default chunk; on Invalid Length, retry with smaller chunk
+			try:
+				await _send_chunks(DEFAULT_CHUNK)
+			except BleakDBusError as exc:
+				# BlueZ may reject larger writes with InvalidArguments/Invalid Length.
+				name = getattr(exc, "error_name", "")
+				msg = str(exc)
+				if "InvalidArguments" in name or "Invalid Length" in msg:
+					SMALL = max(64, DEFAULT_CHUNK // 2)
+					logger.info("Write rejected for chunk size %d, retrying with %d", DEFAULT_CHUNK, SMALL)
+					await _send_chunks(SMALL)
+				else:
+					raise
 			try:
 				await asyncio.wait_for(response_event.wait(), timeout=ISSUER_RESPONSE_TIMEOUT)
 			except asyncio.TimeoutError as exc:
@@ -192,6 +469,7 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 
 	if not result:
 		raise RuntimeError("Issuer beacon returned no response")
+	result = _decode_session_response(result)
 	if result.get("status") != "ok":
 		raise RuntimeError(result.get("message", "Issuer reported an error"))
 
@@ -210,7 +488,7 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 	clock_offset = result.get("clock_offset")
 	if clock_offset is not None:
 		logger.info("Issuer reported clock offset %s", clock_offset)
-	return session_key, expiry, nonce
+	return session_key, expiry + (clock_offset or 0), nonce
 
 class LockAdvertisement(Advertisement):
 	def __init__(self, session_key: bytes, nonce: Optional[str]):
@@ -236,13 +514,28 @@ class LockAdvertisement(Advertisement):
 		try:
 			await interface.call_unregister_advertisement(self._advert_path)
 		except DBusError as exc:
-			if getattr(exc, "name", None) != "org.freedesktop.DBus.Error.DoesNotExist":
+			name = getattr(exc, "name", "") or ""
+			if name not in {
+				"org.freedesktop.DBus.Error.DoesNotExist",
+				"org.freedesktop.DBus.Error.UnknownObject",
+				"org.bluez.Error.DoesNotExist",
+			}:
 				raise
 
 	def update_token(self):
 		token = generate_token(self.session_key, self.nonce)
 		self._manufacturerData[MANUFACTURER_ID] = Variant("ay", token)
 		logger.debug("Updated advertisement token: %s", token.hex())
+
+	@dbus_property(PropertyAccess.READ)
+	def MinInterval(self) -> "q":  # type: ignore[override]
+		"""Minimum BLE advertisement interval in milliseconds."""
+		return BLE_MIN_INTERVAL
+
+	@dbus_property(PropertyAccess.READ)
+	def MaxInterval(self) -> "q":  # type: ignore[override]
+		"""Maximum BLE advertisement interval in milliseconds."""
+		return BLE_MAX_INTERVAL
 
 	@dbus_property(PropertyAccess.READWRITE)
 	def TxPower(self) -> "n":  # type: ignore[override]
