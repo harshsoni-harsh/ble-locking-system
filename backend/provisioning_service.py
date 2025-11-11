@@ -186,17 +186,6 @@ class ProvisioningService(Service):
 		device_path: Optional[str],
 	) -> Dict[str, Any]:
 		request_body = payload
-		sym_key: Optional[bytes] = None
-		
-		if "encrypted_key" in payload:
-			encryption_meta = payload.get("encryption")
-			if not encryption_meta or encryption_meta.get("algorithm") != "HYBRID":
-				return {"status": "error", "message": "unsupported_encryption"}
-			try:
-				request_body, sym_key = self._keystore.decrypt_unlocker_request(payload, encryption_meta)
-			except ValueError as exc:
-				logger.warning("Provisioning request decryption failed: %s", exc)
-				return {"status": "error", "message": str(exc)}
 
 		lock_id = request_body.get("lock_id")
 		if not isinstance(lock_id, str) or not lock_id:
@@ -247,9 +236,5 @@ class ProvisioningService(Service):
 		if key_fingerprint and key_fingerprint != client_id:
 			extra["key_fingerprint"] = key_fingerprint
 		response = {"status": "ok", **extra, **result}
-		
-		# If client sent a symmetric key, encrypt the response with it
-		if sym_key:
-			response = self._keystore.encrypt_response_with_symmetric_key(response, sym_key)
 		
 		return response

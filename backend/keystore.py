@@ -10,7 +10,6 @@ from typing import Any, Dict, Optional, cast
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import (
 	Encoding,
 	PublicFormat,
@@ -156,62 +155,22 @@ class KeyStore:
 			),
 		)
 
-	def decrypt_unlocker_request(self, payload: Any, encryption_meta: Optional[Dict[str, Any]] = None) -> tuple[Dict[str, Any], Optional[bytes]]:
-		"""Decrypt a provisioning request from an unlocker.
+	def encrypt_response_with_rsa(self, response_data: Dict[str, Any], public_key: rsa.RSAPublicKey) -> Dict[str, Any]:
+		"""Encrypt a response using RSA-OAEP with the unlocker's public key.
 		
-		Expects HYBRID format: payload contains 'request' (plaintext dict) and 
-		'encrypted_key' (RSA-OAEP encrypted symmetric key for response encryption).
-		
-		Returns: tuple of (request_dict, symmetric_key_bytes or None)
-		"""
-		if not isinstance(payload, dict):
-			raise ValueError("invalid payload format - expected dict")
-
-		algo = (encryption_meta or {}).get("algorithm") if isinstance(encryption_meta, dict) else None
-		if algo != "HYBRID":
-			raise ValueError(f"unsupported encryption algorithm: {algo}")
-
-		# HYBRID format: plaintext request + RSA-encrypted symmetric key
-		encrypted_key_b64 = payload.get("encrypted_key")
-		if not isinstance(encrypted_key_b64, str) or not encrypted_key_b64:
-			raise ValueError("missing encrypted_key")
-		
-		try:
-			encrypted_key = base64.b64decode(encrypted_key_b64)
-		except (binascii.Error, TypeError) as exc:
-			raise ValueError("invalid encrypted_key encoding") from exc
-		
-		try:
-			sym_key = self.backend_private_key.decrypt(
-				encrypted_key,
-				padding.OAEP(
-					mgf=padding.MGF1(algorithm=hashes.SHA256()),
-					algorithm=hashes.SHA256(),
-					label=None,
-				),
-			)
-		except Exception as exc:
-			raise ValueError("failed to decrypt symmetric key") from exc
-		
-		# Extract plaintext request
-		request_obj = payload.get("request")
-		if not isinstance(request_obj, dict):
-			raise ValueError("missing or invalid request object")
-		
-		return request_obj, sym_key
-
-	def encrypt_response_with_symmetric_key(self, response_data: Dict[str, Any], sym_key: bytes) -> Dict[str, Any]:
-		"""Encrypt a response using AES-GCM with the provided symmetric key.
-		
-		Returns a dict with 'ciphertext' (base64 nonce+ciphertext) and 'encryption' metadata.
+		Returns a dict with 'ciphertext' (base64 RSA ciphertext).
 		"""
 		plaintext = json.dumps(response_data, separators=(",", ":")).encode()
-		aesgcm = AESGCM(sym_key)
-		nonce = os.urandom(12)
-		ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+		ciphertext = public_key.encrypt(
+			plaintext,
+			padding.OAEP(
+				mgf=padding.MGF1(algorithm=hashes.SHA256()),
+				algorithm=hashes.SHA256(),
+				label=None,
+			),
+		)
 		return {
-			"ciphertext": base64.b64encode(nonce + ciphertext).decode(),
-			"encryption": {"algorithm": "HYBRID", "symmetric": "AES-GCM"},
+			"ciphertext": base64.b64encode(ciphertext).decode(),
 		}
 
 	def sign_payload(self, payload: bytes) -> str:

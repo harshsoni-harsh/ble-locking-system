@@ -34,7 +34,6 @@ from cryptography.hazmat.primitives.serialization import (
 	load_pem_private_key,
 	load_pem_public_key,
 )
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -284,7 +283,6 @@ async def find_issuer_beacon(
 async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optional[str]]:
 	"""Request a session key from the issuer beacon."""
 	device = await find_issuer_beacon()
-	backend_public_key = _load_backend_public_key_from_file()
 	response_event = asyncio.Event()
 	result: Dict[str, Any] = {}
 	# Buffer for chunked notifications
@@ -294,14 +292,12 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 		nonlocal result
 		if response_event.is_set():
 			return
-		# Try to decode notification as UTF-8 JSON
 		rb = bytes(data)
 		text: Optional[str] = None
 		try:
 			text = rb.decode()
 			obj = json.loads(text)
 		except Exception:
-			# Not JSON or not UTF8 - log and return
 			logger.error(
 				"Received malformed provisioning response from issuer: not-json (hex=%s, b64=%s)",
 				rb.hex(),
@@ -309,26 +305,21 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 			)
 			return
 
-		# If this is a chunk object, buffer and assemble
 		if isinstance(obj, dict) and {"chunk_index", "total_chunks", "data"}.issubset(obj.keys()):
 			pending = pending_notifications
 			idx = int(obj["chunk_index"])
 			total = int(obj["total_chunks"])
 			if pending["total"] == 0:
 				pending["total"] = total
-			# Store decoded chunk
 			try:
 				part = base64.b64decode(obj["data"])
 			except (binascii.Error, TypeError):
 				logger.error("Received invalid base64 chunk in notification")
 				return
 			pending["parts"][idx] = part
-			# Check completion
 			if len(pending["parts"]) < pending["total"]:
 				return
-			# Assemble
 			assembled = b"".join(pending["parts"][i] for i in range(pending["total"]))
-			# Reset pending
 			pending_notifications["total"] = 0
 			pending_notifications["parts"] = {}
 			try:
@@ -338,39 +329,6 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 				return
 		else:
 			payload = obj
-		
-		# If issuer sent encrypted response with AES-GCM, decrypt using sym_key
-		if isinstance(payload, dict) and payload.get("encryption", {}).get("algorithm") == "HYBRID":
-			ciphertext_b64 = payload.get("ciphertext")
-			if not ciphertext_b64:
-				logger.error("Missing ciphertext in encrypted response")
-				return
-			try:
-				blob = base64.b64decode(ciphertext_b64)
-			except (binascii.Error, TypeError):
-				logger.error("Invalid base64 ciphertext in response")
-				return
-			if len(blob) < 12:
-				logger.error("Ciphertext too short for AES-GCM nonce")
-				return
-			nonce_resp = blob[:12]
-			ct_resp = blob[12:]
-			# Retrieve the symmetric key we stored when sending request
-			sym_key_stored = getattr(handle_notification, "sym_key", None)
-			if not sym_key_stored:
-				logger.error("No symmetric key available to decrypt response")
-				return
-			aesgcm_dec = AESGCM(sym_key_stored)
-			try:
-				plaintext_resp = aesgcm_dec.decrypt(nonce_resp, ct_resp, associated_data=None)
-			except Exception as exc:
-				logger.error("Failed to decrypt response with symmetric key: %s", exc)
-				return
-			try:
-				payload = json.loads(plaintext_resp.decode())
-			except Exception:
-				logger.error("Decrypted response is not valid JSON")
-				return
 		
 		result = payload
 		response_event.set()
@@ -386,17 +344,6 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 			)
 			await client.start_notify(PROVISIONING_CHARACTERISTIC_UUID, handle_notification)
 			
-			# Generate symmetric key for response encryption
-			sym_key = AESGCM.generate_key(bit_length=256)
-			encrypted_sym_key = backend_public_key.encrypt(
-				sym_key,
-				padding.OAEP(
-					mgf=padding.MGF1(algorithm=hashes.SHA256()),
-					algorithm=hashes.SHA256(),
-					label=None,
-				),
-			)
-
 			request_plain: Dict[str, Any] = {
 				"lock_id": lock_id,
 				"client_time": int(time.time()),
@@ -405,17 +352,7 @@ async def request_session_from_issuer(lock_id: str) -> tuple[bytes, int, Optiona
 			if CLIENT_ID:
 				request_plain["client_id"] = CLIENT_ID
 			
-			encrypted_request = {
-				"request": request_plain,
-				"encrypted_key": base64.b64encode(encrypted_sym_key).decode(),
-				"encryption": {
-					"algorithm": "HYBRID",
-					"symmetric": "AES-GCM",
-				},
-			}
-			# Store sym_key for later response decryption
-			handle_notification.sym_key = sym_key  # type: ignore
-			payload_bytes = json.dumps(encrypted_request, separators=(",", ":")).encode()
+			payload_bytes = json.dumps(request_plain, separators=(",", ":")).encode()
 			# BLE GATT writes may have limits; chunk the payload if it's large.
 			DEFAULT_CHUNK = int(os.getenv("PROVISION_CHUNK_SIZE", "120"))
 
